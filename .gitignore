@@ -156,6 +156,34 @@ venv/
 ENV/
 env.bak/
 venv.bak/
+*.pem
+*API_KEY*
+*map_key*
+ 
+# Jupyter Notebook
+.ipynb_checkpoints
+ 
+# DVC
+/data
+*.dvc.lock
+ 
+# MLflow
+mlruns/
+mlartifacts/
+ 
+# Docker
+docker-data/
+ 
+# OS-specific
+.DS_Store
+Thumbs.db
+ 
+# IDE
+.vscode/
+.idea/
+ 
+# Logs
+*.log
 
 # Spyder project settings
 .spyderproject
