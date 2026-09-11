@@ -1,0 +1,32 @@
+{
+  "name": "MLOps-PM25-Prediction",
+  "image": "mcr.microsoft.com/devcontainers/python:3.11",
+
+  "features": {
+    "ghcr.io/devcontainers/features/docker-in-docker:2": {}
+  },
+
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "ms-python.python",
+        "ms-toolsai.jupyter",
+        "ms-azuretools.vscode-docker",
+        "github.vscode-github-actions"
+      ],
+      "settings": {
+        "python.defaultInterpreterPath": "/usr/local/bin/python"
+      }
+    }
+  },
+
+  "postCreateCommand": "pip install --upgrade pip && pip install -r requirements.txt",
+
+  "forwardPorts": [8000, 5000, 9090, 3000],
+  "portsAttributes": {
+    "8000": { "label": "Model Serving" },
+    "5000": { "label": "MLflow Tracking UI" },
+    "9090": { "label": "Prometheus" },
+    "3000": { "label": "Grafana" }
+  }
+}
