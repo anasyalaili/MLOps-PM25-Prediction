@@ -11,6 +11,7 @@ Proyek ini bertujuan membangun sistem end-to-end MLOps yang mampu:
 Berbeda dari pendekatan prediksi AQI konvensional yang hanya mengandalkan data cuaca dan historis polutan, proyek ini menambahkan data titik api satelit (NASA FIRMS) sebagai fitur tambahan untuk meningkatkan horizon prediksi dan nilai preventif sistem.
 
 ## Struktur Direktori
+```
 MLOps-PM25-Prediction/
 ├── .github/
 │   └── workflows/
@@ -35,6 +36,7 @@ MLOps-PM25-Prediction/
 ├── requirements.txt
 ├── LICENSE
 └── README.md
+```
 
 ## Cara Menjalankan Via Codespaces
 Proyek ini menggunakan GitHub Codespaces sebagai cloud development environment yang sudah dikonfigurasi otomatis lewat .devcontainer/devcontainer.json dengan dependency dan extension VS Code yang akan terinstall otomatis tanpa setup manual.
