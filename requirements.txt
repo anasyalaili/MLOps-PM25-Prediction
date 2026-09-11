@@ -1,0 +1,22 @@
+# Data fetching & manipulation
+requests
+pandas
+numpy
+python-dotenv
+haversine
+
+# Visualization (EDA)
+matplotlib
+
+# Machine Learning
+scikit-learn
+xgboost
+
+# Experiment Tracking & Model Registry
+mlflow
+
+# Data Versioning
+dvc
+
+# Interactive Notebook
+ipykernel
