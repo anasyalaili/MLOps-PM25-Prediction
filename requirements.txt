@@ -5,6 +5,10 @@ numpy
 python-dotenv
 haversine
 
+# Standarization (PEP8)
+black
+flake8
+
 # Visualization (EDA)
 matplotlib
 
