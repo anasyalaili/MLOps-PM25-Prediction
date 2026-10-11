@@ -17,20 +17,25 @@ MLOps-PM25-Prediction/
 │   └── workflows/
 ├── .devcontainer/
 │   └── devcontainer.json
+├── .dvc/
+│   ├── cache
+│   ├── .gitignore
+│   ├── config
+│   └── config.local
 ├── config/
 ├── data/
 ├── docs/
 ├── models/
 ├── notebooks/
 ├── src/
-│   ├── ingest_data.py      # Data ingestion (weather, air quality, FIRMS)
-│   ├── preprocess.py       # Cleaning data mentah -> data/interim/
+│   ├── ingest_data.py
+│   ├── preprocess.py
 │   └── ...                 # Feature engineering, training, serving (tahap berikutnya)
 ├── tests/
 ├── .env
 ├── .gitignore
-├── .flake8                 # Konfigurasi flake8 (PEP 8, maks 79 karakter)
-├── pyproject.toml          # Konfigurasi black (line-length 79)
+├── .flake8
+├── pyproject.toml
 ├── Dockerfile
 ├── docker-compose.yml
 ├── dvc.yaml
@@ -94,34 +99,89 @@ MAP_KEY gratis dari `https://firms.modaps.eosdis.nasa.gov/api/map_key/`. Jika be
 
 Jalankan dari **root repositori** (bukan dari dalam folder `src/`), karena path data bersifat relatif.
 
-### 1. `src/ingest_data.py` — Data Ingestion
+## Menjalankan Ingestion
 
-Mengambil data dari tiga sumber dan menyimpannya sebagai data mentah di `data/raw/`. Nama file diberi timestamp UTC sehingga run berulang **tidak menimpa** data lama.
+Skrip `src/ingest_data.py` mengambil data dari tiga sumber (Open-Meteo Weather Open-Meteo Air Quality, NASA FIRMS) dan menyimpannya ke
+`data/raw/` dengan nama berstempel waktu UTC, sehingga data lama tidak pernah tertimpa.
 
-```bash
-python src/ingest_data.py
-```
+    # data terbaru (2 hari terakhir, tumpang tindih sebagai pengaman)
+    python src/ingest_data.py
 
-Satu kali run sudah menarik `PAST_DAYS = 30` hari ke belakang ditambah prakiraan, sehingga menghasilkan sekitar **840 baris data per jam** (di atas target 500 baris) tanpa perlu menjalankannya berkali-kali. Ubah `PAST_DAYS` (maksimal 92 sesuai batas Open-Meteo) untuk memperbesar volume.
+    # isi riwayat, mis. 30 hari ke belakang
+    python src/ingest_data.py --mode backfill --backfill-days 30
 
-### 2. `src/preprocess.py` — Prapemrosesan (Cleaning)
+Prasyarat: `FIRMS_MAP_KEY` di file `.env` (tidak pernah di-commit).
 
-Membaca **seluruh** file mentah di `data/raw/`, menggabungkannya (baris dengan waktu yang sama diambil dari file terbaru), membersihkan, lalu menyimpan hasilnya ke `data/interim/`.
+Penanganan kegagalan:
+- Jika API mengembalikan status 5xx atau timeout, skrip mencoba ulang maksimal 3 kali dengan jeda 5s, 15s, 45s.
+- Jika ketiga percobaan gagal, sumber lain tetap diproses dan kegagalan dicatat di `logs/ingestion_YYYYMMDD.log`. Exit code program 1 jika ada sumber yang gagal.
+- Jika `FIRMS_MAP_KEY` belum diset, sumber FIRMS dihitung gagal (bukan dilewati) karena FIRMS adalah leading indicator proyek ini.
 
-```bash
-python src/preprocess.py
-```
+Struktur keluaran:
 
-Tahapan cleaning: buang nilai kosong, validasi rentang nilai (kelembapan dan tutupan awan 0-100; polutan, angin, dan hujan tidak negatif), filter confidence titik api FIRMS, dan deduplikasi. Jalankan skrip ini **setelah** `ingest_data.py`.
+| Folder | Isi |
+|---|---|
+| `data/raw/weather/` | JSON cuaca per jam |
+| `data/raw/air_quality/` | JSON PM2.5, PM10, AQI per jam |
+| `data/raw/firms/` | CSV titik api per deteksi satelit |
+| `logs/` | Log ingestion harian |
 
-### Menjalankan keduanya berurutan
+## Prapemrosesan
 
-```bash
-python src/ingest_data.py
-python src/preprocess.py
-```
+    python src/preprocess.py
 
-Mengulang kedua perintah kapan saja (misalnya tiap jam lewat GitHub Actions) menambah data baru; `preprocess.py` otomatis menggabungkan semuanya sehingga volume terus bertambah.
+Membaca semua file di `data/raw/`, membuang duplikat (baris dari file terbaru yang dipertahankan), membuang nilai kosong, memvalidasi rentang nilai, dan menyaring titik api FIRMS berdasarkan confidence. Hasilnya disimpan di `data/interim/`.
+
+## Versioning Data dengan DVC
+
+Data mentah (`data/raw/`) dilacak DVC, bukan Git. Git hanya menyimpan file penunjuk `data/raw.dvc` (berisi hash), sedangkan data aslinya disimpan di remote storage **Nextcloud** (WebDAV).
+
+### Setup
+
+    pip install -r requirements.txt
+    dvc remote modify --local nextcloud user <USERNAME>
+    dvc remote modify --local nextcloud password '<APP_PASSWORD>'
+    dvc pull
+
+- Gunakan *app password* (Nextcloud: Settings, Security, Devices & sessions), bukan password akun.
+- Kredensial hanya disimpan lokal di `.dvc/config.local` yang tidak ikut ter-commit.
+
+### Alur menambah versi data baru
+
+1. Ambil data tambahan: `python src/ingest_data.py` (atau mode backfill)
+2. Cek perubahan: `dvc status`
+3. Lacak versi baru: `dvc add data/raw`
+4. Commit penunjuknya dan beri tag:
+
+       git add data/raw.dvc
+       git commit -m "feat: perbarui dataset"
+       git tag -a data-vN -m "keterangan"
+
+5. Kirim data ke remote: `dvc push`
+
+### Membandingkan dan memulihkan versi
+
+    dvc diff data-v1 data-v2
+    git diff data-v1 data-v2 -- data/raw.dvc
+
+    git checkout data-v1 && dvc checkout     # kembali ke v1
+    git checkout main && dvc checkout        # kembali ke versi terbaru
+
+### Riwayat versi
+
+| Tag | Isi | Keterangan |
+|---|---|---|
+| data-v1 | `<nfiles>` file, `<N1>` baris bersih | data awal + backfill 7 hari |
+| data-v2 | `<nfiles>` file, `<N2>` baris bersih | ditambah backfill 30 hari |
+
+Hash `data/raw.dvc` tiap versi: v1 `<md5 v1>`, v2 `<md5 v2>`.
+
+### Catatan
+
+- `data/raw` tidak lagi dilacak Git. Setelah clone, jalankan `dvc pull`
+  untuk mengambil data.
+- Ingestion otomatis berkala (GitHub Actions) belum aktif dan akan
+  ditambahkan pada tahap berikutnya.
 
 ## Deskripsi Format Output Data
 

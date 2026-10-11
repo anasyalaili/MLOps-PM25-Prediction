@@ -21,6 +21,7 @@ mlflow
 
 # Data Versioning
 dvc
+dvc[webdav]
 
 # Interactive Notebook
 ipykernel
