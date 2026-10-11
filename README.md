@@ -171,10 +171,10 @@ Data mentah (`data/raw/`) dilacak DVC, bukan Git. Git hanya menyimpan file penun
 
 | Tag | Isi | Keterangan |
 |---|---|---|
-| data-v1 | `<nfiles>` file, `<N1>` baris bersih | data awal + backfill 7 hari |
-| data-v2 | `<nfiles>` file, `<N2>` baris bersih | ditambah backfill 30 hari |
+| data-v1 | `5` file, `1832359` baris bersih | data awal + backfill 7 hari |
+| data-v2 | `8` file, `8815819` baris bersih | ditambah backfill 30 hari |
 
-Hash `data/raw.dvc` tiap versi: v1 `<md5 v1>`, v2 `<md5 v2>`.
+Hash `data/raw.dvc` tiap versi: v1 `1c96e53f1abbef87d533d54b73df9029.dir`, v2 `cf18d7de25f3a9fbe1dcd25acde45a7c.dir`.
 
 ### Catatan
 
