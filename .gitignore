@@ -164,8 +164,11 @@ venv.bak/
 .ipynb_checkpoints
  
 # DVC
-/data
-*.dvc.lock
+data/raw/
+data/interim/
+data/processed/
+!data/**/*.dvc
+!data/*.dvc
  
 # MLflow
 mlruns/
@@ -183,6 +186,7 @@ Thumbs.db
 .idea/
  
 # Logs
+logs/
 *.log
 
 # Spyder project settings

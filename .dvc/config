@@ -1,0 +1,4 @@
+[core]
+    remote = nextcloud
+['remote "nextcloud"']
+    url = webdavs://cloud.jestro.my.id/remote.php/dav/files/anasya/dvc_storage
