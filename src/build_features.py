@@ -24,10 +24,23 @@ LOCAL_TZ = "Asia/Jakarta"
 INTERIM_DIR = os.path.join("data", "interim")
 OUTPUT_DIR = os.path.join("data", "processed")
 OUTPUT_COLUMNS = [
-    "timestamp", "location", "temperature_2m", "relative_humidity_2m",
-    "wind_speed_10m", "precipitation", "cloud_cover", "pm2_5", "pm10",
-    "european_aqi", "pm2_5_lag_1h", "pm2_5_lag_6h", "hotspot_count_100km",
-    "hotspot_count_log", "hour_of_day", "is_dry_season", "target_pm2_5_h6",
+    "timestamp",
+    "location",
+    "temperature_2m",
+    "relative_humidity_2m",
+    "wind_speed_10m",
+    "precipitation",
+    "cloud_cover",
+    "pm2_5",
+    "pm10",
+    "european_aqi",
+    "pm2_5_lag_1h",
+    "pm2_5_lag_6h",
+    "hotspot_count_100km",
+    "hotspot_count_log",
+    "hour_of_day",
+    "is_dry_season",
+    "target_pm2_5_h6",
 ]
 
 
@@ -37,10 +50,11 @@ def parse_arguments(argv=None):
     parser.add_argument("--interim-dir", default=INTERIM_DIR)
     parser.add_argument("--output-dir", default=OUTPUT_DIR)
     parser.add_argument(
-        "--cutoff", default=None,
+        "--cutoff",
+        default=None,
         help="Jam observasi terakhir (WIB, 'YYYY-MM-DD HH:MM'). Baris "
-             "setelahnya dianggap prakiraan dan dibuang. Default: jam "
-             "sekarang WIB.",
+        "setelahnya dianggap prakiraan dan dibuang. Default: jam "
+        "sekarang WIB.",
     )
     return parser.parse_args(argv)
 
@@ -52,8 +66,10 @@ def haversine_km(lat1, lon1, lat2, lon2):
     phi2 = np.radians(lat2)
     d_phi = phi2 - phi1
     d_lambda = np.radians(lon2) - math.radians(lon1)
-    a = (np.sin(d_phi / 2) ** 2
-         + math.cos(phi1) * np.cos(phi2) * np.sin(d_lambda / 2) ** 2)
+    a = (
+        np.sin(d_phi / 2) ** 2
+        + math.cos(phi1) * np.cos(phi2) * np.sin(d_lambda / 2) ** 2
+    )
     return 2 * radius_earth * np.arcsin(np.sqrt(a))
 
 
@@ -65,19 +81,21 @@ def firms_local_datetime(firms):
     utc = pd.to_datetime(
         firms["acq_date"].astype(str) + " " + hhmm, format="%Y-%m-%d %H%M"
     )
-    return utc.dt.tz_localize("UTC").dt.tz_convert(LOCAL_TZ).dt.tz_localize(
-        None
+    return (
+        utc.dt.tz_localize("UTC").dt.tz_convert(LOCAL_TZ).dt.tz_localize(None)
     )
 
 
 def count_hotspots(hours, hotspot_times):
     """Jumlah titik api pada (t - 24 jam, t] untuk setiap jam t."""
     times = np.sort(hotspot_times.values.astype("datetime64[ns]"))
-    upper = np.searchsorted(times, hours.values.astype("datetime64[ns]"),
-                            side="right")
+    upper = np.searchsorted(
+        times, hours.values.astype("datetime64[ns]"), side="right"
+    )
     lower_edge = (hours - pd.Timedelta(hours=WINDOW_HOURS)).values
-    lower = np.searchsorted(times, lower_edge.astype("datetime64[ns]"),
-                            side="right")
+    lower = np.searchsorted(
+        times, lower_edge.astype("datetime64[ns]"), side="right"
+    )
     return upper - lower
 
 
@@ -86,7 +104,8 @@ def build_hotspot_feature(hours, firms):
     firms = firms.copy()
     firms["dt_local"] = firms_local_datetime(firms)
     dist = haversine_km(
-        LATITUDE, LONGITUDE,
+        LATITUDE,
+        LONGITUDE,
         firms["latitude"].astype(float).values,
         firms["longitude"].astype(float).values,
     )
@@ -107,8 +126,9 @@ def build_features(weather, firms, cutoff):
     df["timestamp"] = pd.to_datetime(df["timestamp"])
     df = df.drop_duplicates("timestamp", keep="last")
     df = df[df["timestamp"] <= cutoff].sort_values("timestamp")
-    full = pd.date_range(df["timestamp"].min(), df["timestamp"].max(),
-                         freq="h")
+    full = pd.date_range(
+        df["timestamp"].min(), df["timestamp"].max(), freq="h"
+    )
     df = df.set_index("timestamp").reindex(full)
     df.index.name = "timestamp"
 
@@ -121,8 +141,9 @@ def build_features(weather, firms, cutoff):
     df["hotspot_count_100km"] = counts
     df["hotspot_count_log"] = np.log1p(counts)
     df["hour_of_day"] = df["timestamp"].dt.hour
-    df["is_dry_season"] = df["timestamp"].dt.month.isin(
-        DRY_SEASON_MONTHS).astype(int)
+    df["is_dry_season"] = (
+        df["timestamp"].dt.month.isin(DRY_SEASON_MONTHS).astype(int)
+    )
     df["location"] = LOCATION
     return df, start, end
 
@@ -134,8 +155,10 @@ def finalize(df):
     df = df[OUTPUT_COLUMNS].copy()
     df["hotspot_count_100km"] = df["hotspot_count_100km"].astype(int)
     df["european_aqi"] = df["european_aqi"].round().astype(int)
-    print(f"Baris dibuang (tanpa label/lag/cakupan FIRMS): "
-          f"{before - len(df)} dari {before}")
+    print(
+        f"Baris dibuang (tanpa label/lag/cakupan FIRMS): "
+        f"{before - len(df)} dari {before}"
+    )
     return df.reset_index(drop=True)
 
 
@@ -143,15 +166,16 @@ def save_partitions(df, output_dir):
     """Tulis per bulan; partisi bulan yang sama ditimpa (idempoten)."""
     try:
         import pyarrow  # noqa: F401
+
         extension = "parquet"
     except ImportError:
         extension = "csv"
         print("pyarrow tidak ada, menyimpan CSV (pasang pyarrow!).")
     paths = []
     for (year, month), part in df.groupby(
-            [df["timestamp"].dt.year, df["timestamp"].dt.month]):
-        folder = os.path.join(output_dir, f"year={year}",
-                              f"month={month:02d}")
+        [df["timestamp"].dt.year, df["timestamp"].dt.month]
+    ):
+        folder = os.path.join(output_dir, f"year={year}", f"month={month:02d}")
         os.makedirs(folder, exist_ok=True)
         path = os.path.join(folder, f"data.{extension}")
         if extension == "parquet":
@@ -172,8 +196,11 @@ def main(argv=None):
         if not os.path.exists(path):
             print(f"ERROR: {path} tidak ada. Jalankan preprocess.py dulu.")
             return 1
-    cutoff = (pd.Timestamp(args.cutoff) if args.cutoff else
-              pd.Timestamp.now(tz=LOCAL_TZ).tz_localize(None).floor("h"))
+    cutoff = (
+        pd.Timestamp(args.cutoff)
+        if args.cutoff
+        else pd.Timestamp.now(tz=LOCAL_TZ).tz_localize(None).floor("h")
+    )
     weather = pd.read_csv(weather_path)
     firms = pd.read_csv(firms_path)
     df, start, end = build_features(weather, firms, cutoff)
@@ -183,8 +210,10 @@ def main(argv=None):
     if result.empty:
         print("ERROR: hasil kosong. Cek cutoff dan cakupan FIRMS.")
         return 1
-    print(f"Rentang processed: {result['timestamp'].min()} s.d. "
-          f"{result['timestamp'].max()} ({len(result)} baris)")
+    print(
+        f"Rentang processed: {result['timestamp'].min()} s.d. "
+        f"{result['timestamp'].max()} ({len(result)} baris)"
+    )
     save_partitions(result, args.output_dir)
     return 0
 

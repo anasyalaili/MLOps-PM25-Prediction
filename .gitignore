@@ -171,6 +171,7 @@ data/processed/
 !data/*.dvc
  
 # MLflow
+mlflow.db
 mlruns/
 mlartifacts/
  
