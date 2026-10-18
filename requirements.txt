@@ -9,6 +9,9 @@ haversine
 black
 flake8
 
+# Feature Engineering
+pyarrow
+
 # Visualization (EDA)
 matplotlib
 
