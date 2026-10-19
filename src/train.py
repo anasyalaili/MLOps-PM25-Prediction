@@ -52,6 +52,10 @@ SPIKE_RATIO = 1.5
 MIN_ROWS_PER_SPLIT = 24
 HOTSPOT_FEATURES = ["hotspot_count_100km", "hotspot_count_log"]
 TRUSTED_SKOPS_TYPES = ["sklearn.tree._tree.Tree"]
+XGB_SKOPS_TYPES = [
+    "xgboost.core.Booster",
+    "xgboost.sklearn.XGBRegressor",
+]
 FEATURES = [
     "temperature_2m",
     "relative_humidity_2m",
@@ -309,7 +313,10 @@ def walk_forward_scores(df, features, args):
             compute_seasonal_baseline_metrics(df, test, "fold"))
     if not model_rows:
         raise ValueError("Tidak ada fold walk-forward yang valid.")
-    summary = {"cv_folds_used": float(len(model_rows))}
+    wins = sum(m["fold_rmse"] < b["fold_rmse"]
+               for m, b in zip(model_rows, seasonal_rows))
+    summary = {"cv_folds_used": float(len(model_rows)),
+               "cv_rmse_wins_vs_seasonal": float(wins)}
     summary.update(summarize_folds(model_rows, "cv"))
     summary.update(summarize_folds(seasonal_rows, "cv_seasonal"))
     return summary
@@ -406,7 +413,10 @@ def collect_data_lineage(data_version=None):
 def log_model_artifact(mlflow, model, args):
     """Log model; kompatibel MLflow 2.x (artifact_path) dan 3.x (name)."""
     import mlflow.sklearn
-    kwargs = {"skops_trusted_types": TRUSTED_SKOPS_TYPES}
+    trusted = list(TRUSTED_SKOPS_TYPES)
+    if args.model == "xgb":
+        trusted += XGB_SKOPS_TYPES
+    kwargs = {"skops_trusted_types": trusted}
     if args.register_model:
         kwargs["registered_model_name"] = "pm25-karhutla-h6"
     try:

@@ -217,6 +217,101 @@ Contoh baris: `2026-08-29 00:00:00,25.2,76,9.7,0.0,15,81.7,84.3,126`
 
 **`firms_clean.csv`** — kolom sama dengan CSV FIRMS mentah, hanya berisi deteksi berkepercayaan cukup (VIIRS level `n`/`h`, atau MODIS di atas 70) tanpa duplikat. File ini tidak dibuat jika tidak ada titik api.
 
+## Eksperimen Training dan MLflow
+
+Semua eksperimen dilatih di atas dataset ber-versi DVC **`data-v3`**
+(`data/processed`, skema LK-03) dan dicatat ke MLflow (backend SQLite
+`mlflow.db`, experiment `pm25-karhutla-h6`). Setiap run mencatat parameter,
+metrik, grafik feature importance, model, dan jejak silsilah data
+(`git_commit`, `data_version`, md5 pointer DVC).
+
+### Metodologi Evaluasi
+
+- **Tugas:** regresi PM2.5 enam jam ke depan (`target_pm2_5_h6`), 14 fitur
+  (cuaca, polutan, lag 1 jam dan 6 jam, hotspot FIRMS, waktu).
+- **Split kronologis** (tanpa diacak): test = 7 hari terakhir, validasi = 7 hari
+  sebelumnya, dengan jeda 6 jam agar tidak ada kebocoran label.
+- **Walk-forward cross-validation:** 4 fold berurutan, masing-masing 7 hari.
+  Tiap fold hanya dilatih dari data yang lebih lama.
+- **Dua baseline** dihitung di setiap run:
+  persistensi (prediksi = PM2.5 saat ini) dan musiman
+  ("jam yang sama kemarin").
+- **Aturan pemilihan model:** kriteria utama `cv_rmse_mean`; selisih yang masih
+  di dalam simpangan baku dianggap setara; set test hanya dilaporkan, tidak
+  dipakai untuk memilih.
+- **Metrik kelas:** `gt150` dan `gt500` (PM2.5 di atas ambang) serta
+  **lonjakan** (PM2.5 jam t+6 lebih dari 1,5 kali nilai saat ini).
+
+### Hasil Run
+
+| No | Run | CV RMSE (± std) | CV MAE | Val RMSE | Test RMSE | CV spike P / R | Menang vs baseline* |
+|---|---|---|---|---|---|---|---|
+| 01 | Linear Regression | 892,7 ± 807,7 | 365,6 | 340,5 | 634,4 | 0,769 / 0,838 | 0 |
+| 02 | RF 100 pohon, depth 5 | 434,1 ± 117,7 | 288,4 | 300,5 | 610,0 | 0,902 / 0,769 | 2 |
+| **03** | **RF 300 pohon, depth 10 (champion)** | **423,8 ± 124,1** | **285,0** | 261,8 | 609,3 | 0,915 / 0,759 | 2 |
+| 04 | RF 300/10, min leaf 3 | 426,9 ± 125,1 | 285,5 | 262,3 | 608,9 | 0,915 / 0,759 | 2 |
+| 05 | Gradient Boosting 300/3 (challenger) | 432,3 ± 126,4 | 293,5 | 281,9 | 588,8 | 0,896 / 0,763 | 2 |
+| 06 | XGBoost 200/4 | 434,9 ± 122,4 | 290,7 | 268,7 | 605,6 | 0,913 / 0,764 | 2 |
+| 07 | RF tanpa hotspot | 431,8 ± 83,2 | 288,5 | 308,6 | 580,7 | 0,911 / 0,779 | 3 |
+| 08 | RF tanpa `european_aqi` | 427,7 ± 131,5 | 288,1 | 259,3 | 623,0 | 0,903 / 0,759 | 2 |
+| 09 | RF dengan log-target | 446,6 ± 163,2 | 299,5 | 298,1 | 671,6 | 0,922 / 0,713 | 3 |
+| – | Baseline "jam yang sama kemarin" | 442,8 ± 144,8 | 327,7 | 340,5 | 556,9 | 0,667 / 0,835 | – |
+| – | Baseline persistensi | – | – | – | 1104,5 | 0 / 0 | – |
+
+\* Jumlah fold (dari 4) tempat RMSE model lebih kecil daripada baseline musiman.
+Satuan RMSE dan MAE: µg/m³. Spike P / R = precision / recall kelas lonjakan.
+
+### Champion dan challenger
+
+- **Champion: Run 03, Random Forest (300 pohon, depth 10, 14 fitur)**,
+  karena `cv_rmse_mean` terendah (423,8).
+- **Challenger: Run 05, Gradient Boosting (300 pohon, depth 3)**, model
+  terbaik dari keluarga algoritma lain. Performanya setara dengan champion
+  dan tidak membutuhkan pustaka tambahan.
+- Model berbasis pohon (RF, GBR, XGBoost) berselisih sekitar 3% di CV, jauh di
+  bawah simpangan baku antar fold (sekitar 125), sehingga secara statistik
+  dianggap setara. Linear Regression tidak stabil (std 807,7).
+
+### Temuan Utama
+
+1. **Champion vs baseline musiman:** CV RMSE turun 4,3% (423,8 vs 442,8) dan CV
+   MAE turun 13,0% (285,0 vs 327,7). Selisih RMSE berada di dalam simpangan
+   baku antar fold, model hanya menang di 2 dari 4 fold, dan di minggu test
+   terakhir baseline lebih baik (RMSE 556,9 vs 609,3). Nilai tambah model
+   moderat dan belum konsisten.
+2. **Ablation hotspot FIRMS (Run 07 vs 03):** penurunan CV RMSE akibat hotspot
+   hanya (431,8 - 423,8) / 431,8 = **1,8%**, di bawah target 10% pada LK-01.
+   Hasil validasi menguntungkan hotspot (-15,2%), tetapi di test hotspot
+   justru 4,9% lebih buruk, dan model tanpa hotspot menang di 3 dari 4 fold.
+   Importance fitur hotspot di GBR, XGBoost, dan RF juga tidak berbeda dari
+   nol. Kontribusi hotspot pada horizon 6 jam tidak terbukti pada data ini.
+3. **`european_aqi` (Run 08 vs 03):** selisih CV RMSE di bawah 1%, tidak
+   berpengaruh berarti.
+4. **Log-target (Run 09):** lebih buruk di semua evaluasi dan CV RMSE-nya
+   melewati baseline musiman (446,6 vs 442,8). Tidak digunakan.
+5. **Hyperparameter:** RF lebih dalam dengan lebih banyak pohon (Run 03)
+   sedikit lebih baik daripada 100 pohon depth 5 (Run 02); `min_samples_leaf` 3
+   (Run 04) tidak mengubah hasil.
+6. **Feature importance (permutation, data validasi):** model terutama
+   mengandalkan `temperature_2m` dan `hour_of_day`, yaitu siklus harian
+   PM2.5, bukan sinyal kebakaran.
+
+
+### Cara mereproduksi
+
+```bash
+pip install -r requirements.txt
+dvc pull                       # ambil data terbaru dari remote Nextcloud
+python src/features/build_features.py   # hanya jika data/processed belum ada
+
+# contoh:
+python src/train.py --n-estimators 300 --max-depth 10 --cv-folds 4 \
+    --data-version data-v3 --run-name 03-rf-300-d10-champion
+
+# dashboard MLflow
+mlflow ui --backend-store-uri sqlite:///mlflow.db --port 5000
+```
+
 ## Standar Kode (PEP 8)
 
 Kode mengikuti PEP 8: nama variabel deskriptif, docstring pada setiap modul dan fungsi, dan maksimal 79 karakter per baris. Konfigurasi ada di `pyproject.toml` (black) dan `.flake8`.
