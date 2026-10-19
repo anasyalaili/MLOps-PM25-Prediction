@@ -419,9 +419,7 @@ def ingest_firms(run_timestamp, mode, backfill_days):
 
     today = datetime.now(timezone.utc).date()
     csv_texts = []
-    for day_range, start_date in build_firms_plan(
-        mode, backfill_days, today
-    ):
+    for day_range, start_date in build_firms_plan(mode, backfill_days, today):
         url = build_firms_url(map_key, day_range, start_date)
         csv_texts.append(get_with_retry(url).text)
 

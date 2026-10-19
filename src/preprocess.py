@@ -53,6 +53,7 @@ NUMERIC_CONFIDENCE_THRESHOLD = 70
 # Zona waktu yang dipakai weather & AQI. FIRMS (acq_time) memakai UTC.
 JAKARTA_TZ = "Asia/Jakarta"
 
+
 def report_step(step_name, rows_before, rows_after):
     """Cetak ringkasan jumlah baris sebelum dan sesudah satu langkah.
 
@@ -132,9 +133,7 @@ def load_firms_files(filepaths):
     if not frames:
         return pd.DataFrame()
     combined_df = pd.concat(frames, ignore_index=True)
-    return combined_df.drop_duplicates(
-        subset=FIRMS_DEDUP_COLUMNS, keep="last"
-    )
+    return combined_df.drop_duplicates(subset=FIRMS_DEDUP_COLUMNS, keep="last")
 
 
 def add_firms_jakarta_time(hotspots_df):
@@ -212,9 +211,7 @@ def drop_missing_values(weather_air_df):
         pd.DataFrame: Data tanpa nilai kosong.
     """
     cleaned_df = weather_air_df.dropna()
-    report_step(
-        "Buang nilai kosong", len(weather_air_df), len(cleaned_df)
-    )
+    report_step("Buang nilai kosong", len(weather_air_df), len(cleaned_df))
     return cleaned_df
 
 
@@ -239,9 +236,7 @@ def remove_out_of_range_values(weather_air_df):
             is_valid &= weather_air_df[column] >= 0
 
     cleaned_df = weather_air_df[is_valid]
-    report_step(
-        "Validasi rentang nilai", len(weather_air_df), len(cleaned_df)
-    )
+    report_step("Validasi rentang nilai", len(weather_air_df), len(cleaned_df))
     return cleaned_df
 
 
@@ -280,9 +275,7 @@ def filter_firms_confidence(hotspots_df, min_level="n"):
         is_confident_detection, min_level=min_level
     )
     filtered_df = hotspots_df[is_confident]
-    report_step(
-        "Filter confidence FIRMS", len(hotspots_df), len(filtered_df)
-    )
+    report_step("Filter confidence FIRMS", len(hotspots_df), len(filtered_df))
     return filtered_df
 
 
