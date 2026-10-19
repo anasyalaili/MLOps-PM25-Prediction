@@ -30,11 +30,15 @@ MLOps-PM25-Prediction/
 ├── src/
 │   ├── ingest_data.py
 │   ├── preprocess.py
-│   └── ...                 # Feature engineering, training, serving (tahap berikutnya)
+│   ├── build_features.py
+│   ├── train.py
+│   └── ...
 ├── tests/
 ├── .env
 ├── .gitignore
+├── .dvcignore
 ├── .flake8
+├── mlflow.db
 ├── pyproject.toml
 ├── Dockerfile
 ├── docker-compose.yml
@@ -43,8 +47,6 @@ MLOps-PM25-Prediction/
 ├── LICENSE
 └── README.md
 ```
-
-*(Struktur ini akan berkembang secara bertahap mengikuti progres LK-02 s.d. LK-14 — beberapa folder seperti `models/` dan `docker-compose.yml` baru benar-benar terisi di tahap-tahap selanjutnya.)*
 
 ## Cara Menjalankan via GitHub Codespaces
 
