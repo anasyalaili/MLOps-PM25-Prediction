@@ -1,30 +1,30 @@
 # Data fetching & manipulation
-requests
-pandas
-numpy
-python-dotenv
-haversine
+requests==2.34.2
+pandas==3.0.5
+numpy==2.5.3
+python-dotenv==1.2.3
+haversine==2.9.0
 
 # Standarization (PEP8)
-black
-flake8
+black==26.5.1
+flake8==7.4.1
 
 # Feature Engineering
-pyarrow
+pyarrow==25.0.1
 
 # Visualization (EDA)
-matplotlib
+matplotlib==3.11.2
 
 # Machine Learning
-scikit-learn
-xgboost
+scikit-learn==1.9.1
+xgboost==3.4.1
 
 # Experiment Tracking & Model Registry
-mlflow
+mlflow==3.16.1
 
 # Data Versioning
-dvc
-dvc[webdav]
+dvc==3.67.1
+dvc[webdav]==3.0.1
 
 # Interactive Notebook
-ipykernel
+ipykernel==7.3.0
