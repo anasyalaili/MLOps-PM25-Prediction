@@ -1,0 +1,6 @@
+outs:
+- md5: 511b399826cb3a6684ed492571736dcb.dir
+  size: 2916
+  nfiles: 2
+  hash: md5
+  path: registry
