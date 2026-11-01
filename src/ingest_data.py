@@ -1,18 +1,26 @@
 """Data ingestion berkala untuk proyek prediksi PM2.5 akibat karhutla.
 
-Dijalankan otomatis oleh GitHub Actions (cron tiap jam pada menit
-ke-5). Mengambil data dari tiga sumber API publik dan menyimpannya
+Dijalankan otomatis oleh GitHub Actions (cron tiap 3 jam). Mengambil
+data dari tiga sumber API publik dan menyimpannya
 sebagai data mentah di data/raw/:
 
-    1. Open-Meteo Weather API -> data/raw/weather/*.json
-    2. Open-Meteo Air Quality -> data/raw/air_quality/*.json
-    3. NASA FIRMS (titik api) -> data/raw/firms/*.csv
+   1. Open-Meteo Weather API -> data/raw/weather/*.json
+   2. Open-Meteo Air Quality -> data/raw/air_quality/*.json
+   3. NASA FIRMS (titik api) -> data/raw/firms/*.csv
 
 Mode:
-    incremental (default): ambil data terbaru saja. Jendelanya sengaja
-        tumpang tindih dengan run sebelumnya sebagai pengaman jika ada
-        run yang terlewat; duplikat dibuang di preprocess.py.
-    backfill: dijalankan sekali untuk mengisi riwayat awal.
+   incremental (default): ambil data terbaru saja. Jendelanya sengaja
+       tumpang tindih dengan run sebelumnya sebagai pengaman jika ada
+       run yang terlewat; duplikat dibuang di preprocess.py.
+   backfill: dijalankan sekali untuk mengisi riwayat awal (maksimal 92
+       hari ke belakang dari hari ini).
+   historical: mengisi riwayat panjang untuk rentang tanggal tertentu
+       (--start-date dan --end-date), mis. satu musim kemarau tahun
+       lalu. Memakai arsip: Open-Meteo Historical Forecast (cuaca),
+       Open-Meteo Air Quality dengan tanggal, dan FIRMS standard
+       processing (VIIRS_SNPP_SP). File diberi penanda "_hist_" pada
+       namanya agar preprocess.py selalu memprioritaskan data live
+       pada tanggal yang tumpang tindih.
 
 Setiap file diberi timestamp UTC sehingga run berulang tidak pernah
 menimpa data lama. Kegagalan satu sumber tidak menghentikan sumber
@@ -20,12 +28,14 @@ lain dan dicatat ke logs/ingestion_YYYYMMDD.log. Jika ada sumber yang
 gagal, exit code program adalah 1.
 
 Cara run manual (uji coba):
-    python src/ingest_data.py
-    python src/ingest_data.py --mode backfill --backfill-days 30
+   python src/ingest_data.py
+   python src/ingest_data.py --mode backfill --backfill-days 30
+   python src/ingest_data.py --mode historical \
+       --start-date 2023-06-01 --end-date 2023-11-30
 
 Environment variable:
-    FIRMS_MAP_KEY : API key NASA FIRMS. Di GitHub Actions diambil dari
-        Secrets, di lokal dari file .env.
+   FIRMS_MAP_KEY : API key NASA FIRMS. Di GitHub Actions diambil dari
+       Secrets, di lokal dari file .env.
 """
 
 import argparse
@@ -36,7 +46,7 @@ import logging
 import os
 import sys
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 
 import requests
 from dotenv import load_dotenv
@@ -55,13 +65,26 @@ FIRMS_SOURCE = "VIIRS_SNPP_NRT"
 FIRMS_BOUNDING_BOX = "110.5,-3.5,115.5,1.0"
 # Batas aman yang sudah terbukti diterima API untuk key ini.
 FIRMS_MAX_DAY_RANGE = 5
+# Arsip untuk mode historical.
+HISTORICAL_WEATHER_URL = (
+   "https://historical-forecast-api.open-meteo.com/v1/forecast"
+)
+FIRMS_HISTORICAL_SOURCE = "VIIRS_SNPP_SP"
+# Data FIRMS ditarik mulai sekian hari sebelum start-date supaya jendela
+# 24 jam (dan tren 48 jam) fitur hotspot pada jam-jam awal rentang sudah
+# terisi, bukan terhitung 'nol titik api'.
+FIRMS_HISTORICAL_MARGIN_DAYS = 2
+HISTORICAL_FILE_MARKER = "hist"
+# Open-Meteo Air Quality global (CAMS) tersedia sejak Agustus 2022.
+AIR_QUALITY_GLOBAL_START = date(2022, 8, 1)
+MAX_HISTORICAL_DAYS = 366
 
 WEATHER_VARIABLES = (
-    "temperature_2m",
-    "relative_humidity_2m",
-    "wind_speed_10m",
-    "precipitation",
-    "cloud_cover",
+   "temperature_2m",
+   "relative_humidity_2m",
+   "wind_speed_10m",
+   "precipitation",
+   "cloud_cover",
 )
 AIR_QUALITY_VARIABLES = ("pm2_5", "pm10", "european_aqi")
 
@@ -83,423 +106,545 @@ logger = logging.getLogger("ingest")
 
 
 class MissingCredentialError(Exception):
-    """Dilempar saat API key yang dibutuhkan belum diset."""
+   """Dilempar saat API key yang dibutuhkan belum diset."""
 
 
 def parse_arguments(argv=None):
-    """Baca argumen command line.
+   """Baca argumen command line.
 
-    Args:
-        argv (list): Daftar argumen; None berarti memakai sys.argv.
+   Args:
+       argv (list): Daftar argumen; None berarti memakai sys.argv.
 
-    Returns:
-        argparse.Namespace: Berisi mode dan backfill_days.
-    """
-    parser = argparse.ArgumentParser(description="Data ingestion berkala.")
-    parser.add_argument(
-        "--mode",
-        choices=("incremental", "backfill"),
-        default="incremental",
-        help="incremental: data terbaru; backfill: isi riwayat awal.",
-    )
-    parser.add_argument(
-        "--backfill-days",
-        type=int,
-        default=DEFAULT_BACKFILL_DAYS,
-        help="Jumlah hari ke belakang untuk mode backfill.",
-    )
-    return parser.parse_args(argv)
+   Returns:
+       argparse.Namespace: Berisi mode dan backfill_days.
+   """
+   parser = argparse.ArgumentParser(description="Data ingestion berkala.")
+   parser.add_argument(
+       "--mode",
+       choices=("incremental", "backfill", "historical"),
+       default="incremental",
+       help="incremental: data terbaru; backfill: isi riwayat awal; "
+       "historical: isi rentang tanggal tertentu dari arsip.",
+   )
+   parser.add_argument(
+       "--backfill-days",
+       type=int,
+       default=DEFAULT_BACKFILL_DAYS,
+       help="Jumlah hari ke belakang untuk mode backfill.",
+   )
+   parser.add_argument(
+       "--start-date",
+       type=parse_date,
+       help="Mode historical: tanggal awal (YYYY-MM-DD), inklusif.",
+   )
+   parser.add_argument(
+       "--end-date",
+       type=parse_date,
+       help="Mode historical: tanggal akhir (YYYY-MM-DD), inklusif.",
+   )
+   args = parser.parse_args(argv)
+   today = datetime.now(timezone.utc).date()
+   error = check_date_range(args.mode, args.start_date, args.end_date, today)
+   if error:
+       parser.error(error)
+   return args
+
+
+def parse_date(text):
+   """Ubah teks YYYY-MM-DD menjadi date (untuk argparse).
+
+   Args:
+       text (str): Tanggal format YYYY-MM-DD.
+
+   Returns:
+       datetime.date: Tanggal hasil parsing.
+   """
+   try:
+       return datetime.strptime(text, "%Y-%m-%d").date()
+   except ValueError as error:
+       raise argparse.ArgumentTypeError(
+           f"tanggal harus YYYY-MM-DD, bukan '{text}'"
+       ) from error
+
+
+def check_date_range(mode, start_date, end_date, today):
+   """Validasi --start-date dan --end-date terhadap mode.
+
+   Args:
+       mode (str): incremental, backfill, atau historical.
+       start_date (datetime.date): Tanggal awal atau None.
+       end_date (datetime.date): Tanggal akhir atau None.
+       today (datetime.date): Tanggal hari ini (UTC).
+
+   Returns:
+       str: Pesan error, atau None jika valid.
+   """
+   if mode != "historical":
+       if start_date or end_date:
+           return "--start-date/--end-date hanya untuk --mode historical."
+       return None
+   if not start_date or not end_date:
+       return "--mode historical membutuhkan --start-date dan --end-date."
+   if start_date > end_date:
+       return "--start-date tidak boleh setelah --end-date."
+   if end_date >= today:
+       return "--end-date harus sebelum hari ini (hanya hari yang lengkap)."
+   if start_date < AIR_QUALITY_GLOBAL_START:
+       return (
+           f"--start-date sebelum {AIR_QUALITY_GLOBAL_START}: data air "
+           "quality global Open-Meteo belum tersedia."
+       )
+   days = (end_date - start_date).days + 1
+   if days > MAX_HISTORICAL_DAYS:
+       return (
+           f"Rentang {days} hari melebihi batas {MAX_HISTORICAL_DAYS}. "
+           "Jalankan per musim atau per tahun."
+       )
+   return None
 
 
 def configure_logging(run_date):
-    """Siapkan logging ke konsol dan ke logs/ingestion_YYYYMMDD.log.
+   """Siapkan logging ke konsol dan ke logs/ingestion_YYYYMMDD.log.
 
-    Args:
-        run_date (str): Tanggal UTC format YYYYMMDD.
+   Args:
+       run_date (str): Tanggal UTC format YYYYMMDD.
 
-    Returns:
-        str: Path file log.
-    """
-    os.makedirs(LOG_DIR, exist_ok=True)
-    log_path = os.path.join(LOG_DIR, f"ingestion_{run_date}.log")
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(message)s",
-        handlers=[
-            logging.FileHandler(log_path, encoding="utf-8"),
-            logging.StreamHandler(),
-        ],
-        force=True,
-    )
-    return log_path
+   Returns:
+       str: Path file log.
+   """
+   os.makedirs(LOG_DIR, exist_ok=True)
+   log_path = os.path.join(LOG_DIR, f"ingestion_{run_date}.log")
+   logging.basicConfig(
+       level=logging.INFO,
+       format="%(asctime)s %(levelname)s %(message)s",
+       handlers=[
+           logging.FileHandler(log_path, encoding="utf-8"),
+           logging.StreamHandler(),
+       ],
+       force=True,
+   )
+   return log_path
 
 
 def create_raw_directories():
-    """Buat folder data/raw/<sumber> jika belum ada."""
-    for subfolder in RAW_SUBFOLDERS:
-        os.makedirs(os.path.join(RAW_DIR, subfolder), exist_ok=True)
+   """Buat folder data/raw/<sumber> jika belum ada."""
+   for subfolder in RAW_SUBFOLDERS:
+       os.makedirs(os.path.join(RAW_DIR, subfolder), exist_ok=True)
 
 
 def describe_error(error):
-    """Ringkas error tanpa membocorkan URL (berisi API key).
+   """Ringkas error tanpa membocorkan URL (berisi API key).
 
-    Args:
-        error (Exception): Error yang terjadi.
+   Args:
+       error (Exception): Error yang terjadi.
 
-    Returns:
-        str: Deskripsi singkat berisi nama error dan status HTTP.
-    """
-    if isinstance(error, requests.exceptions.RequestException):
-        status_code = getattr(error.response, "status_code", None)
-        return f"{type(error).__name__} (status={status_code})"
-    return str(error)
+   Returns:
+       str: Deskripsi singkat berisi nama error dan status HTTP.
+   """
+   if isinstance(error, requests.exceptions.RequestException):
+       status_code = getattr(error.response, "status_code", None)
+       return f"{type(error).__name__} (status={status_code})"
+   return str(error)
 
 
 def is_retryable(error):
-    """Tentukan apakah error layak dicoba ulang.
+   """Tentukan apakah error layak dicoba ulang.
 
-    Hanya timeout, gangguan koneksi, dan status 5xx yang dicoba ulang.
-    Error 4xx (key salah, parameter salah) tidak akan membaik.
+   Hanya timeout, gangguan koneksi, dan status 5xx yang dicoba ulang.
+   Error 4xx (key salah, parameter salah) tidak akan membaik.
 
-    Args:
-        error (requests.exceptions.RequestException): Error request.
+   Args:
+       error (requests.exceptions.RequestException): Error request.
 
-    Returns:
-        bool: True jika sebaiknya dicoba ulang.
-    """
-    if isinstance(
-        error,
-        (requests.exceptions.Timeout, requests.exceptions.ConnectionError),
-    ):
-        return True
-    response = getattr(error, "response", None)
-    return (
-        response is not None
-        and response.status_code >= SERVER_ERROR_MIN_STATUS
-    )
+   Returns:
+       bool: True jika sebaiknya dicoba ulang.
+   """
+   if isinstance(
+       error,
+       (requests.exceptions.Timeout, requests.exceptions.ConnectionError),
+   ):
+       return True
+   response = getattr(error, "response", None)
+   return (
+       response is not None
+       and response.status_code >= SERVER_ERROR_MIN_STATUS
+   )
 
 
 def get_with_retry(url, params=None, sleep=time.sleep):
-    """GET dengan retry exponential backoff (5s, 15s, 45s).
+   """GET dengan retry exponential backoff (5s, 15s, 45s).
 
-    Args:
-        url (str): URL tujuan.
-        params (dict): Query parameter opsional.
-        sleep (callable): Fungsi jeda; dapat diganti saat pengujian.
+   Args:
+       url (str): URL tujuan.
+       params (dict): Query parameter opsional.
+       sleep (callable): Fungsi jeda; dapat diganti saat pengujian.
 
-    Returns:
-        requests.Response: Respons sukses.
+   Returns:
+       requests.Response: Respons sukses.
 
-    Raises:
-        requests.exceptions.RequestException: Jika semua percobaan
-            gagal atau error tidak layak dicoba ulang.
-    """
-    max_retries = len(RETRY_DELAYS_SECONDS)
-    for attempt in range(max_retries + 1):
-        try:
-            response = requests.get(
-                url, params=params, timeout=REQUEST_TIMEOUT_SECONDS
-            )
-            response.raise_for_status()
-            return response
-        except requests.exceptions.RequestException as error:
-            if attempt == max_retries or not is_retryable(error):
-                raise
-            delay = RETRY_DELAYS_SECONDS[attempt]
-            logger.warning(
-                "Retry %d/%d dalam %ds: %s",
-                attempt + 1,
-                max_retries,
-                delay,
-                describe_error(error),
-            )
-            sleep(delay)
+   Raises:
+       requests.exceptions.RequestException: Jika semua percobaan
+           gagal atau error tidak layak dicoba ulang.
+   """
+   max_retries = len(RETRY_DELAYS_SECONDS)
+   for attempt in range(max_retries + 1):
+       try:
+           response = requests.get(
+               url, params=params, timeout=REQUEST_TIMEOUT_SECONDS
+           )
+           response.raise_for_status()
+           return response
+       except requests.exceptions.RequestException as error:
+           if attempt == max_retries or not is_retryable(error):
+               raise
+           delay = RETRY_DELAYS_SECONDS[attempt]
+           logger.warning(
+               "Retry %d/%d dalam %ds: %s",
+               attempt + 1,
+               max_retries,
+               delay,
+               describe_error(error),
+           )
+           sleep(delay)
 
 
 def clamp_backfill_days(backfill_days):
-    """Batasi jumlah hari backfill ke rentang 1 sampai 92.
+   """Batasi jumlah hari backfill ke rentang 1 sampai 92.
 
-    Args:
-        backfill_days (int): Nilai yang diminta pengguna.
+   Args:
+       backfill_days (int): Nilai yang diminta pengguna.
 
-    Returns:
-        int: Nilai yang sudah dibatasi.
-    """
-    return max(1, min(backfill_days, MAX_BACKFILL_DAYS))
+   Returns:
+       int: Nilai yang sudah dibatasi.
+   """
+   return max(1, min(backfill_days, MAX_BACKFILL_DAYS))
 
 
 def determine_past_days(mode, backfill_days):
-    """Tentukan nilai past_days Open-Meteo sesuai mode.
+   """Tentukan nilai past_days Open-Meteo sesuai mode.
 
-    Args:
-        mode (str): incremental atau backfill.
-        backfill_days (int): Jumlah hari untuk mode backfill.
+   Args:
+       mode (str): incremental atau backfill.
+       backfill_days (int): Jumlah hari untuk mode backfill.
 
-    Returns:
-        int: Nilai parameter past_days.
-    """
-    if mode == "backfill":
-        return backfill_days
-    return INCREMENTAL_PAST_DAYS
-
-
-def build_raw_filepath(subfolder, run_timestamp, extension):
-    """Susun path file mentah berdasarkan sumber dan timestamp.
-
-    Args:
-        subfolder (str): Nama subfolder sumber di dalam data/raw/.
-        run_timestamp (str): Timestamp run ingestion.
-        extension (str): Ekstensi file tanpa titik.
-
-    Returns:
-        str: Path lengkap file tujuan.
-    """
-    filename = f"{subfolder}_{run_timestamp}.{extension}"
-    return os.path.join(RAW_DIR, subfolder, filename)
+   Returns:
+       int: Nilai parameter past_days.
+   """
+   if mode == "backfill":
+       return backfill_days
+   return INCREMENTAL_PAST_DAYS
 
 
-def request_open_meteo(url, hourly_variables, past_days):
-    """Panggil endpoint Open-Meteo dan kembalikan respons JSON.
+def build_raw_filepath(subfolder, run_timestamp, extension, date_range=None):
+   """Susun path file mentah berdasarkan sumber dan timestamp.
 
-    Args:
-        url (str): URL endpoint Open-Meteo.
-        hourly_variables (tuple): Nama variabel per jam yang diminta.
-        past_days (int): Jumlah hari ke belakang.
+   Args:
+       subfolder (str): Nama subfolder sumber di dalam data/raw/.
+       run_timestamp (str): Timestamp run ingestion.
+       extension (str): Ekstensi file tanpa titik.
+       date_range (tuple): (start, end) untuk mode historical, atau
+           None. File historical memuat penanda "_hist_" dan rentang
+           tanggalnya pada nama.
 
-    Returns:
-        dict: Respons JSON hasil parsing.
-    """
-    params = {
-        "latitude": LATITUDE,
-        "longitude": LONGITUDE,
-        "hourly": ",".join(hourly_variables),
-        "past_days": past_days,
-        "timezone": TIMEZONE_NAME,
-    }
-    return get_with_retry(url, params=params).json()
+   Returns:
+       str: Path lengkap file tujuan.
+   """
+   if date_range:
+       start, end = date_range
+       filename = (
+           f"{subfolder}_{HISTORICAL_FILE_MARKER}_{start:%Y%m%d}_"
+           f"{end:%Y%m%d}_{run_timestamp}.{extension}"
+       )
+   else:
+       filename = f"{subfolder}_{run_timestamp}.{extension}"
+   return os.path.join(RAW_DIR, subfolder, filename)
+
+
+def request_open_meteo(url, hourly_variables, past_days, date_range=None):
+   """Panggil endpoint Open-Meteo dan kembalikan respons JSON.
+
+   Args:
+       url (str): URL endpoint Open-Meteo.
+       hourly_variables (tuple): Nama variabel per jam yang diminta.
+       past_days (int): Jumlah hari ke belakang (diabaikan jika
+           date_range diberikan).
+       date_range (tuple): (start, end) tanggal inklusif, atau None.
+
+   Returns:
+       dict: Respons JSON hasil parsing.
+   """
+   params = {
+       "latitude": LATITUDE,
+       "longitude": LONGITUDE,
+       "hourly": ",".join(hourly_variables),
+       "timezone": TIMEZONE_NAME,
+   }
+   if date_range:
+       params["start_date"] = date_range[0].isoformat()
+       params["end_date"] = date_range[1].isoformat()
+   else:
+       params["past_days"] = past_days
+   return get_with_retry(url, params=params).json()
 
 
 def save_json(data, filepath):
-    """Simpan dictionary ke file JSON.
+   """Simpan dictionary ke file JSON.
 
-    Args:
-        data (dict): Data yang akan disimpan.
-        filepath (str): Lokasi file tujuan.
-    """
-    with open(filepath, "w", encoding="utf-8") as output_file:
-        json.dump(data, output_file, indent=2)
-
-
-def ingest_weather(run_timestamp, mode, backfill_days):
-    """Ambil data cuaca Open-Meteo dan simpan sebagai JSON mentah.
-
-    Args:
-        run_timestamp (str): Timestamp run untuk nama file.
-        mode (str): incremental atau backfill.
-        backfill_days (int): Jumlah hari untuk mode backfill.
-
-    Returns:
-        str: Path file yang disimpan.
-    """
-    past_days = determine_past_days(mode, backfill_days)
-    data = request_open_meteo(WEATHER_URL, WEATHER_VARIABLES, past_days)
-    filepath = build_raw_filepath("weather", run_timestamp, "json")
-    save_json(data, filepath)
-    row_count = len(data["hourly"]["time"])
-    logger.info("Weather: %d baris -> %s", row_count, filepath)
-    return filepath
+   Args:
+       data (dict): Data yang akan disimpan.
+       filepath (str): Lokasi file tujuan.
+   """
+   with open(filepath, "w", encoding="utf-8") as output_file:
+       json.dump(data, output_file, indent=2)
 
 
-def ingest_air_quality(run_timestamp, mode, backfill_days):
-    """Ambil data kualitas udara Open-Meteo dan simpan sebagai JSON.
+def ingest_weather(run_timestamp, mode, backfill_days, date_range=None):
+   """Ambil data cuaca Open-Meteo dan simpan sebagai JSON mentah.
 
-    Args:
-        run_timestamp (str): Timestamp run untuk nama file.
-        mode (str): incremental atau backfill.
-        backfill_days (int): Jumlah hari untuk mode backfill.
+   Args:
+       run_timestamp (str): Timestamp run untuk nama file.
+       mode (str): incremental, backfill, atau historical.
+       backfill_days (int): Jumlah hari untuk mode backfill.
+       date_range (tuple): (start, end) untuk mode historical.
 
-    Returns:
-        str: Path file yang disimpan.
-    """
-    past_days = determine_past_days(mode, backfill_days)
-    data = request_open_meteo(
-        AIR_QUALITY_URL, AIR_QUALITY_VARIABLES, past_days
-    )
-    filepath = build_raw_filepath("air_quality", run_timestamp, "json")
-    save_json(data, filepath)
-    row_count = len(data["hourly"]["time"])
-    logger.info("Air quality: %d baris -> %s", row_count, filepath)
-    return filepath
-
-
-def build_firms_plan(mode, backfill_days, today):
-    """Susun daftar request FIRMS (day_range, tanggal mulai).
-
-    Mode incremental cukup satu request tanpa tanggal. Mode backfill
-    dipecah per 5 hari karena batas day_range per request.
-
-    Args:
-        mode (str): incremental atau backfill.
-        backfill_days (int): Jumlah hari untuk mode backfill.
-        today (datetime.date): Tanggal hari ini (UTC).
-
-    Returns:
-        list: Pasangan (day_range, start_date); start_date bisa None.
-    """
-    if mode == "incremental":
-        return [(INCREMENTAL_FIRMS_DAYS, None)]
-    plan = []
-    current = today - timedelta(days=backfill_days - 1)
-    while current <= today:
-        days = min(FIRMS_MAX_DAY_RANGE, (today - current).days + 1)
-        plan.append((days, current))
-        current += timedelta(days=FIRMS_MAX_DAY_RANGE)
-    return plan
+   Returns:
+       str: Path file yang disimpan.
+   """
+   past_days = determine_past_days(mode, backfill_days)
+   url = HISTORICAL_WEATHER_URL if date_range else WEATHER_URL
+   data = request_open_meteo(url, WEATHER_VARIABLES, past_days, date_range)
+   filepath = build_raw_filepath("weather", run_timestamp, "json", date_range)
+   save_json(data, filepath)
+   row_count = len(data["hourly"]["time"])
+   logger.info("Weather: %d baris -> %s", row_count, filepath)
+   return filepath
 
 
-def build_firms_url(map_key, day_range, start_date):
-    """Susun URL FIRMS area endpoint.
+def ingest_air_quality(run_timestamp, mode, backfill_days, date_range=None):
+   """Ambil data kualitas udara Open-Meteo dan simpan sebagai JSON.
 
-    Args:
-        map_key (str): API key FIRMS.
-        day_range (int): Jumlah hari per request.
-        start_date (datetime.date): Tanggal mulai, atau None untuk
-            data terbaru.
+   Args:
+       run_timestamp (str): Timestamp run untuk nama file.
+       mode (str): incremental, backfill, atau historical.
+       backfill_days (int): Jumlah hari untuk mode backfill.
+       date_range (tuple): (start, end) untuk mode historical.
 
-    Returns:
-        str: URL lengkap.
-    """
-    parts = [
-        FIRMS_BASE_URL,
-        map_key,
-        FIRMS_SOURCE,
-        FIRMS_BOUNDING_BOX,
-        str(day_range),
-    ]
-    if start_date is not None:
-        parts.append(start_date.isoformat())
-    return "/".join(parts)
+   Returns:
+       str: Path file yang disimpan.
+   """
+   past_days = determine_past_days(mode, backfill_days)
+   data = request_open_meteo(
+       AIR_QUALITY_URL, AIR_QUALITY_VARIABLES, past_days, date_range
+   )
+   filepath = build_raw_filepath(
+       "air_quality", run_timestamp, "json", date_range
+   )
+   save_json(data, filepath)
+   row_count = len(data["hourly"]["time"])
+   logger.info("Air quality: %d baris -> %s", row_count, filepath)
+   return filepath
+
+
+def build_firms_plan(mode, backfill_days, today, date_range=None):
+   """Susun daftar request FIRMS (day_range, tanggal mulai).
+
+   Mode incremental cukup satu request tanpa tanggal. Mode backfill
+   dan historical dipecah per 5 hari karena batas day_range per
+   request. Mode historical dimulai FIRMS_HISTORICAL_MARGIN_DAYS hari
+   lebih awal dari start-date.
+
+   Args:
+       mode (str): incremental, backfill, atau historical.
+       backfill_days (int): Jumlah hari untuk mode backfill.
+       today (datetime.date): Tanggal hari ini (UTC).
+       date_range (tuple): (start, end) untuk mode historical.
+
+   Returns:
+       list: Pasangan (day_range, start_date); start_date bisa None.
+   """
+   if mode == "incremental":
+       return [(INCREMENTAL_FIRMS_DAYS, None)]
+   if date_range:
+       first = date_range[0] - timedelta(days=FIRMS_HISTORICAL_MARGIN_DAYS)
+       last = date_range[1]
+   else:
+       first = today - timedelta(days=backfill_days - 1)
+       last = today
+   plan = []
+   current = first
+   while current <= last:
+       days = min(FIRMS_MAX_DAY_RANGE, (last - current).days + 1)
+       plan.append((days, current))
+       current += timedelta(days=FIRMS_MAX_DAY_RANGE)
+   return plan
+
+
+def build_firms_url(map_key, day_range, start_date, source=FIRMS_SOURCE):
+   """Susun URL FIRMS area endpoint.
+
+   Args:
+       map_key (str): API key FIRMS.
+       day_range (int): Jumlah hari per request.
+       start_date (datetime.date): Tanggal mulai, atau None untuk
+           data terbaru.
+       source (str): Sumber FIRMS, mis. VIIRS_SNPP_NRT atau
+           VIIRS_SNPP_SP.
+
+   Returns:
+       str: URL lengkap.
+   """
+   parts = [
+       FIRMS_BASE_URL,
+       map_key,
+       source,
+       FIRMS_BOUNDING_BOX,
+       str(day_range),
+   ]
+   if start_date is not None:
+       parts.append(start_date.isoformat())
+   return "/".join(parts)
 
 
 def merge_csv_texts(csv_texts):
-    """Gabungkan beberapa teks CSV dengan satu header saja.
+   """Gabungkan beberapa teks CSV dengan satu header saja.
 
-    Args:
-        csv_texts (list): Isi CSV lengkap beserta header.
+   Args:
+       csv_texts (list): Isi CSV lengkap beserta header.
 
-    Returns:
-        str: CSV gabungan, atau string kosong jika tidak ada isi.
-    """
-    merged_lines = []
-    for text in csv_texts:
-        lines = text.strip().splitlines()
-        if not lines:
-            continue
-        merged_lines.extend(lines if not merged_lines else lines[1:])
-    return "\n".join(merged_lines) + "\n" if merged_lines else ""
+   Returns:
+       str: CSV gabungan, atau string kosong jika tidak ada isi.
+   """
+   merged_lines = []
+   for text in csv_texts:
+       lines = text.strip().splitlines()
+       if not lines:
+           continue
+       merged_lines.extend(lines if not merged_lines else lines[1:])
+   return "\n".join(merged_lines) + "\n" if merged_lines else ""
 
 
-def ingest_firms(run_timestamp, mode, backfill_days):
-    """Ambil data titik api NASA FIRMS dan simpan sebagai CSV mentah.
+def ingest_firms(run_timestamp, mode, backfill_days, date_range=None):
+   """Ambil data titik api NASA FIRMS dan simpan sebagai CSV mentah.
 
-    Args:
-        run_timestamp (str): Timestamp run untuk nama file.
-        mode (str): incremental atau backfill.
-        backfill_days (int): Jumlah hari untuk mode backfill.
+   Mode historical memakai VIIRS_SNPP_SP (arsip standard processing),
+   mode lain memakai VIIRS_SNPP_NRT.
 
-    Returns:
-        str: Path file yang disimpan.
+   Args:
+       run_timestamp (str): Timestamp run untuk nama file.
+       mode (str): incremental, backfill, atau historical.
+       backfill_days (int): Jumlah hari untuk mode backfill.
+       date_range (tuple): (start, end) untuk mode historical.
 
-    Raises:
-        MissingCredentialError: Jika FIRMS_MAP_KEY belum diset.
-    """
-    map_key = os.getenv("FIRMS_MAP_KEY", "")
-    if not map_key:
-        raise MissingCredentialError("FIRMS_MAP_KEY belum diset")
+   Returns:
+       str: Path file yang disimpan.
 
-    today = datetime.now(timezone.utc).date()
-    csv_texts = []
-    for day_range, start_date in build_firms_plan(mode, backfill_days, today):
-        url = build_firms_url(map_key, day_range, start_date)
-        csv_texts.append(get_with_retry(url).text)
+   Raises:
+       MissingCredentialError: Jika FIRMS_MAP_KEY belum diset.
+   """
+   map_key = os.getenv("FIRMS_MAP_KEY", "")
+   if not map_key:
+       raise MissingCredentialError("FIRMS_MAP_KEY belum diset")
 
-    merged_text = merge_csv_texts(csv_texts)
-    filepath = build_raw_filepath("firms", run_timestamp, "csv")
-    with open(filepath, "w", encoding="utf-8") as output_file:
-        output_file.write(merged_text)
+   today = datetime.now(timezone.utc).date()
+   csv_texts = []
+   source = FIRMS_HISTORICAL_SOURCE if date_range else FIRMS_SOURCE
+   plan = build_firms_plan(mode, backfill_days, today, date_range)
+   for day_range, start_date in plan:
+       url = build_firms_url(map_key, day_range, start_date, source)
+       csv_texts.append(get_with_retry(url).text)
 
-    hotspot_count = sum(1 for _ in csv.DictReader(io.StringIO(merged_text)))
-    logger.info("FIRMS: %d titik api -> %s", hotspot_count, filepath)
-    return filepath
+   merged_text = merge_csv_texts(csv_texts)
+   filepath = build_raw_filepath("firms", run_timestamp, "csv", date_range)
+   with open(filepath, "w", encoding="utf-8") as output_file:
+       output_file.write(merged_text)
+
+   hotspot_count = sum(1 for _ in csv.DictReader(io.StringIO(merged_text)))
+   logger.info("FIRMS: %d titik api -> %s", hotspot_count, filepath)
+   return filepath
 
 
 def run_ingestion_step(
-    source_name, ingest_function, run_timestamp, mode, backfill_days
+   source_name,
+   ingest_function,
+   run_timestamp,
+   mode,
+   backfill_days,
+   date_range=None,
 ):
-    """Jalankan satu langkah ingestion tanpa menghentikan yang lain.
+   """Jalankan satu langkah ingestion tanpa menghentikan yang lain.
 
-    Args:
-        source_name (str): Nama sumber untuk pesan log.
-        ingest_function (callable): Fungsi ingestion sumber tersebut.
-        run_timestamp (str): Timestamp run untuk nama file.
-        mode (str): incremental atau backfill.
-        backfill_days (int): Jumlah hari untuk mode backfill.
+   Args:
+       source_name (str): Nama sumber untuk pesan log.
+       ingest_function (callable): Fungsi ingestion sumber tersebut.
+       run_timestamp (str): Timestamp run untuk nama file.
+       mode (str): incremental, backfill, atau historical.
+       backfill_days (int): Jumlah hari untuk mode backfill.
+       date_range (tuple): (start, end) untuk mode historical.
 
-    Returns:
-        str: Path file hasil ingestion, atau None jika gagal.
-    """
-    try:
-        return ingest_function(run_timestamp, mode, backfill_days)
-    except (
-        requests.exceptions.RequestException,
-        MissingCredentialError,
-    ) as error:
-        logger.error("%s GAGAL: %s", source_name, describe_error(error))
-        return None
+   Returns:
+       str: Path file hasil ingestion, atau None jika gagal.
+   """
+   try:
+       return ingest_function(run_timestamp, mode, backfill_days, date_range)
+   except (
+       requests.exceptions.RequestException,
+       MissingCredentialError,
+   ) as error:
+       logger.error("%s GAGAL: %s", source_name, describe_error(error))
+       return None
 
 
 def main(argv=None):
-    """Jalankan ingestion untuk ketiga sumber.
+   """Jalankan ingestion untuk ketiga sumber.
 
-    Args:
-        argv (list): Argumen command line; None memakai sys.argv.
+   Args:
+       argv (list): Argumen command line; None memakai sys.argv.
 
-    Returns:
-        int: 0 jika semua sumber berhasil, 1 jika ada yang gagal.
-    """
-    args = parse_arguments(argv)
-    backfill_days = clamp_backfill_days(args.backfill_days)
-    now_utc = datetime.now(timezone.utc)
-    configure_logging(now_utc.strftime("%Y%m%d"))
-    create_raw_directories()
-    run_timestamp = now_utc.strftime("%Y%m%d_%H%M%S")
+   Returns:
+       int: 0 jika semua sumber berhasil, 1 jika ada yang gagal.
+   """
+   args = parse_arguments(argv)
+   backfill_days = clamp_backfill_days(args.backfill_days)
+   now_utc = datetime.now(timezone.utc)
+   configure_logging(now_utc.strftime("%Y%m%d"))
+   create_raw_directories()
+   run_timestamp = now_utc.strftime("%Y%m%d_%H%M%S")
 
-    logger.info("INGESTION mode=%s run=%s", args.mode, run_timestamp)
-    steps = (
-        ("weather", ingest_weather),
-        ("air_quality", ingest_air_quality),
-        ("firms", ingest_firms),
-    )
-    results = {}
-    for source_name, ingest_function in steps:
-        results[source_name] = run_ingestion_step(
-            source_name,
-            ingest_function,
-            run_timestamp,
-            args.mode,
-            backfill_days,
-        )
+   date_range = None
+   if args.mode == "historical":
+       date_range = (args.start_date, args.end_date)
+   logger.info(
+       "INGESTION mode=%s run=%s rentang=%s",
+       args.mode,
+       run_timestamp,
+       date_range,
+   )
+   steps = (
+       ("weather", ingest_weather),
+       ("air_quality", ingest_air_quality),
+       ("firms", ingest_firms),
+   )
+   results = {}
+   for source_name, ingest_function in steps:
+       results[source_name] = run_ingestion_step(
+           source_name,
+           ingest_function,
+           run_timestamp,
+           args.mode,
+           backfill_days,
+           date_range,
+       )
 
-    for source_name, filepath in results.items():
-        status = "BERHASIL" if filepath else "GAGAL"
-        logger.info("  %-12s: %s", source_name, status)
+   for source_name, filepath in results.items():
+       status = "BERHASIL" if filepath else "GAGAL"
+       logger.info("  %-12s: %s", source_name, status)
 
-    failed = [name for name, path in results.items() if path is None]
-    if failed:
-        logger.error("Sumber gagal: %s", ", ".join(failed))
-        return 1
-    return 0
+   failed = [name for name, path in results.items() if path is None]
+   if failed:
+       logger.error("Sumber gagal: %s", ", ".join(failed))
+       return 1
+   return 0
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+   sys.exit(main())
