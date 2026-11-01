@@ -30,6 +30,9 @@ INTERIM_DIR = os.path.join("data", "interim")
 
 MIN_ROWS_TARGET = 500
 
+# Penanda pada nama file hasil ingest_data.py --mode historical.
+HISTORICAL_FILE_MARKER = "_hist_"
+
 # Ambang minimal cakupan FIRMS (hari). Di bawah ini, model berisiko
 # belajar "nol titik api" sebagai fakta padahal itu hanya "tidak ada
 # data".
@@ -69,21 +72,41 @@ def report_step(step_name, rows_before, rows_after):
     )
 
 
-def list_raw_files(subfolder, extension):
-    """Daftar file mentah satu sumber, urut dari yang terlama.
+def raw_file_sort_key(filepath):
+    """Kunci urut file mentah: historical dulu, lalu live menurut nama.
 
-    Nama file memuat timestamp (YYYYMMDD_HHMMSS), sehingga urutan
-    alfabet sama dengan urutan kronologis.
+    Saat tanggal yang sama ada di beberapa file, file yang paling akhir
+    dalam urutan ini menang (keep="last"). File historical (mode
+    historical di ingest_data.py, bertanda "_hist_") diletakkan paling
+    awal sehingga data live pada tanggal yang tumpang tindih selalu
+    menang.
+
+    Args:
+        filepath (str): Path file mentah.
+
+    Returns:
+        tuple: (0 untuk historical atau 1 untuk live, nama file).
+    """
+    name = os.path.basename(filepath)
+    return (0 if HISTORICAL_FILE_MARKER in name else 1, name)
+
+
+def list_raw_files(subfolder, extension):
+    """Daftar file mentah satu sumber, urut dari prioritas terendah.
+
+    Nama file memuat timestamp (YYYYMMDD_HHMMSS), sehingga di antara
+    file live urutan alfabet sama dengan urutan kronologis. File
+    historical diurutkan lebih dulu (lihat raw_file_sort_key).
 
     Args:
         subfolder (str): Nama subfolder sumber di dalam data/raw/.
         extension (str): Ekstensi file tanpa titik.
 
     Returns:
-        list: Path file yang ditemukan, terurut dari terlama.
+        list: Path file yang ditemukan, terurut dari prioritas terendah.
     """
     pattern = os.path.join(RAW_DIR, subfolder, f"*.{extension}")
-    return sorted(glob.glob(pattern))
+    return sorted(glob.glob(pattern), key=raw_file_sort_key)
 
 
 def load_hourly_json_files(filepaths):

@@ -1,8 +1,11 @@
 """Feature engineering: data/interim -> data/processed.
 
-Alur: join weather+AQI, agregasi FIRMS per jam (haversine, radius 100 km,
-jendela 24 jam), fitur lag, fitur temporal, label H+6. Hasil disimpan per
-partisi bulan: data/processed/year=YYYY/month=MM/data.parquet.
+Alur: join weather+AQI, agregasi FIRMS per jam (haversine; beberapa radius,
+jendela 24 jam, FRP, jarak terdekat, tren), fitur lag dan statistik
+bergulir PM2.5, cuaca pada t+6, fitur temporal, label H+6. Hasil disimpan
+per partisi bulan: data/processed/year=YYYY/month=MM/data.parquet.
+
+Skema ini adalah skema v4 (lihat README, bagian Skema Dataset Processed).
 """
 
 import argparse
@@ -16,32 +19,74 @@ import pandas as pd
 LATITUDE = -2.21
 LONGITUDE = 113.92
 LOCATION = "Palangkaraya"
-RADIUS_KM = 100.0
+RADII_KM = (50, 100, 200)
+MAIN_RADIUS_KM = 100
 WINDOW_HOURS = 24
+# Fitur tren membandingkan dua jendela berurutan, jadi cakupan FIRMS
+# minimal dua kali jendela agar jam awal tidak terhitung terlalu rendah.
+COVERAGE_HOURS = 2 * WINDOW_HOURS
+# Jarak yang dipakai jika tidak ada titik api di jendela (di luar bounding
+# box FIRMS, sehingga selalu lebih jauh dari titik api yang mungkin ada).
+NO_HOTSPOT_DISTANCE_KM = 400.0
 HORIZON_HOURS = 6
-DRY_SEASON_MONTHS = (6, 7, 8, 9, 10)
-LOCAL_TZ = "Asia/Jakarta"
-INTERIM_DIR = os.path.join("data", "interim")
-OUTPUT_DIR = os.path.join("data", "processed")
-OUTPUT_COLUMNS = [
-    "timestamp",
-    "location",
+LAG_HOURS = (1, 6, 12, 18, 24)
+ROLLING_HOURS = (6, 24)
+FUTURE_WEATHER = (
     "temperature_2m",
     "relative_humidity_2m",
     "wind_speed_10m",
     "precipitation",
     "cloud_cover",
-    "pm2_5",
-    "pm10",
-    "european_aqi",
-    "pm2_5_lag_1h",
-    "pm2_5_lag_6h",
+)
+DRY_SEASON_MONTHS = (6, 7, 8, 9, 10)
+LOCAL_TZ = "Asia/Jakarta"
+INTERIM_DIR = os.path.join("data", "interim")
+OUTPUT_DIR = os.path.join("data", "processed")
+HOTSPOT_COLUMNS = [
+    "hotspot_count_50km",
     "hotspot_count_100km",
+    "hotspot_count_200km",
     "hotspot_count_log",
-    "hour_of_day",
-    "is_dry_season",
-    "target_pm2_5_h6",
+    "hotspot_frp_sum_100km",
+    "hotspot_nearest_km",
+    "hotspot_trend_100km",
 ]
+HOTSPOT_INT_COLUMNS = [
+    "hotspot_count_50km",
+    "hotspot_count_100km",
+    "hotspot_count_200km",
+    "hotspot_trend_100km",
+]
+OUTPUT_COLUMNS = (
+    [
+        "timestamp",
+        "location",
+        "temperature_2m",
+        "relative_humidity_2m",
+        "wind_speed_10m",
+        "precipitation",
+        "cloud_cover",
+        "pm2_5",
+        "pm10",
+        "european_aqi",
+    ]
+    + [f"pm2_5_lag_{hours}h" for hours in LAG_HOURS]
+    + [
+        f"pm2_5_roll{stat}_{hours}h"
+        for hours in ROLLING_HOURS
+        for stat in ("mean", "max")
+    ]
+    + ["pm2_5_diff_1h", "pm2_5_diff_6h", "precip_sum_24h"]
+    + [f"{column}_h{HORIZON_HOURS}" for column in FUTURE_WEATHER]
+    + HOTSPOT_COLUMNS
+    + [
+        "hour_of_day",
+        "hour_sin",
+        "hour_cos",
+        "is_dry_season",
+        "target_pm2_5_h6",
+    ]
+)
 
 
 def parse_arguments(argv=None):
@@ -86,42 +131,112 @@ def firms_local_datetime(firms):
     )
 
 
-def count_hotspots(hours, hotspot_times):
-    """Jumlah titik api pada (t - 24 jam, t] untuk setiap jam t."""
-    times = np.sort(hotspot_times.values.astype("datetime64[ns]"))
-    upper = np.searchsorted(
-        times, hours.values.astype("datetime64[ns]"), side="right"
-    )
-    lower_edge = (hours - pd.Timedelta(hours=WINDOW_HOURS)).values
-    lower = np.searchsorted(
-        times, lower_edge.astype("datetime64[ns]"), side="right"
-    )
-    return upper - lower
+def window_bounds(times, hours, window_hours, offset_hours=0):
+    """Indeks [lower, upper) titik api pada (t - offset - w, t - offset].
+
+    Args:
+        times: array datetime64[ns] titik api, sudah terurut naik.
+        hours: Series jam t.
+        window_hours: Lebar jendela (jam).
+        offset_hours: Geser jendela ke belakang (jam).
+    """
+    hours_ns = hours.values.astype("datetime64[ns]")
+    upper_edge = hours_ns - np.timedelta64(offset_hours, "h")
+    lower_edge = upper_edge - np.timedelta64(window_hours, "h")
+    upper = np.searchsorted(times, upper_edge, side="right")
+    lower = np.searchsorted(times, lower_edge, side="right")
+    return lower, upper
 
 
-def build_hotspot_feature(hours, firms):
-    """Hitung hotspot_count_100km; jam di luar cakupan FIRMS jadi NaN."""
+def windowed_sum(values, bounds):
+    """Jumlah values pada tiap jendela (jumlah kumulatif, tanpa loop)."""
+    lower, upper = bounds
+    cumulative = np.concatenate([[0.0], np.cumsum(values, dtype=float)])
+    return cumulative[upper] - cumulative[lower]
+
+
+def nearest_distance(dist, bounds):
+    """Jarak titik api terdekat (km) pada tiap jendela."""
+    lower, upper = bounds
+    nearest = np.full(len(lower), NO_HOTSPOT_DISTANCE_KM)
+    for i, (low, up) in enumerate(zip(lower, upper)):
+        if up > low:
+            nearest[i] = min(dist[low:up].min(), NO_HOTSPOT_DISTANCE_KM)
+    return nearest
+
+
+def build_hotspot_features(hours, firms):
+    """Fitur hotspot per jam; jam di luar cakupan FIRMS jadi NaN.
+
+    Semua fitur memakai titik api dengan waktu akuisisi <= jam t, jadi tidak
+    ada kebocoran dari masa depan.
+    """
     firms = firms.copy()
-    firms["dt_local"] = firms_local_datetime(firms)
+    local = firms_local_datetime(firms)
+    order = np.argsort(local.values.astype("datetime64[ns]"))
+    times = local.values.astype("datetime64[ns]")[order]
     dist = haversine_km(
         LATITUDE,
         LONGITUDE,
         firms["latitude"].astype(float).values,
         firms["longitude"].astype(float).values,
-    )
-    near = firms.loc[dist <= RADIUS_KM, "dt_local"]
-    counts = count_hotspots(hours, near).astype(float)
-    start = firms["dt_local"].min().floor("h")
-    end = firms["dt_local"].max().floor("h")
-    covered = ((hours - pd.Timedelta(hours=WINDOW_HOURS - 1)) >= start) & (
+    )[order]
+    if "frp" in firms.columns:
+        frp = pd.to_numeric(firms["frp"], errors="coerce").fillna(0.0)
+        frp = frp.to_numpy()[order]
+    else:
+        frp = np.zeros(len(firms))
+
+    current = window_bounds(times, hours, WINDOW_HOURS)
+    previous = window_bounds(times, hours, WINDOW_HOURS, WINDOW_HOURS)
+    out = {}
+    for radius in RADII_KM:
+        within = (dist <= radius).astype(float)
+        out[f"hotspot_count_{radius}km"] = windowed_sum(within, current)
+    count_main = out[f"hotspot_count_{MAIN_RADIUS_KM}km"]
+    within_main = (dist <= MAIN_RADIUS_KM).astype(float)
+    count_previous = windowed_sum(within_main, previous)
+    out["hotspot_count_log"] = np.log1p(count_main)
+    out["hotspot_frp_sum_100km"] = windowed_sum(frp * within_main, current)
+    out["hotspot_nearest_km"] = nearest_distance(dist, current)
+    out["hotspot_trend_100km"] = count_main - count_previous
+
+    features = pd.DataFrame(out)[HOTSPOT_COLUMNS]
+    start = local.min().floor("h")
+    end = local.max().floor("h")
+    covered = ((hours - pd.Timedelta(hours=COVERAGE_HOURS - 1)) >= start) & (
         hours <= end
     )
-    counts[~covered.values] = np.nan
-    return counts, start, end
+    features[~covered.to_numpy()] = np.nan
+    return features, start, end
+
+
+def add_pm25_features(df):
+    """Lag, statistik bergulir, dan selisih PM2.5 (hanya data <= t)."""
+    pm25 = df["pm2_5"]
+    for hours in LAG_HOURS:
+        df[f"pm2_5_lag_{hours}h"] = pm25.shift(hours)
+    for hours in ROLLING_HOURS:
+        rolling = pm25.rolling(hours, min_periods=hours)
+        df[f"pm2_5_rollmean_{hours}h"] = rolling.mean()
+        df[f"pm2_5_rollmax_{hours}h"] = rolling.max()
+    df["pm2_5_diff_1h"] = pm25 - df["pm2_5_lag_1h"]
+    df["pm2_5_diff_6h"] = pm25 - df["pm2_5_lag_6h"]
+    df["precip_sum_24h"] = (
+        df["precipitation"].rolling(24, min_periods=24).sum()
+    )
+    return df
+
+
+def add_future_weather(df):
+    """Cuaca pada t+6 (di inferensi berasal dari prakiraan cuaca)."""
+    for column in FUTURE_WEATHER:
+        df[f"{column}_h{HORIZON_HOURS}"] = df[column].shift(-HORIZON_HOURS)
+    return df
 
 
 def build_features(weather, firms, cutoff):
-    """Bangun tabel fitur lengkap sesuai skema LK-03."""
+    """Bangun tabel fitur lengkap (skema v4)."""
     df = weather.rename(columns={"time": "timestamp"}).copy()
     df["timestamp"] = pd.to_datetime(df["timestamp"])
     df = df.drop_duplicates("timestamp", keep="last")
@@ -132,15 +247,18 @@ def build_features(weather, firms, cutoff):
     df = df.set_index("timestamp").reindex(full)
     df.index.name = "timestamp"
 
-    df["pm2_5_lag_1h"] = df["pm2_5"].shift(1)
-    df["pm2_5_lag_6h"] = df["pm2_5"].shift(6)
+    df = add_pm25_features(df)
+    df = add_future_weather(df)
     df["target_pm2_5_h6"] = df["pm2_5"].shift(-HORIZON_HOURS)
     df = df.reset_index()
 
-    counts, start, end = build_hotspot_feature(df["timestamp"], firms)
-    df["hotspot_count_100km"] = counts
-    df["hotspot_count_log"] = np.log1p(counts)
-    df["hour_of_day"] = df["timestamp"].dt.hour
+    hotspots, start, end = build_hotspot_features(df["timestamp"], firms)
+    for column in HOTSPOT_COLUMNS:
+        df[column] = hotspots[column].to_numpy()
+    hour = df["timestamp"].dt.hour
+    df["hour_of_day"] = hour
+    df["hour_sin"] = np.sin(2 * np.pi * hour / 24)
+    df["hour_cos"] = np.cos(2 * np.pi * hour / 24)
     df["is_dry_season"] = (
         df["timestamp"].dt.month.isin(DRY_SEASON_MONTHS).astype(int)
     )
@@ -153,7 +271,8 @@ def finalize(df):
     before = len(df)
     df = df.dropna(subset=[c for c in OUTPUT_COLUMNS if c != "location"])
     df = df[OUTPUT_COLUMNS].copy()
-    df["hotspot_count_100km"] = df["hotspot_count_100km"].astype(int)
+    for column in HOTSPOT_INT_COLUMNS:
+        df[column] = df[column].round().astype(int)
     df["european_aqi"] = df["european_aqi"].round().astype(int)
     print(
         f"Baris dibuang (tanpa label/lag/cakupan FIRMS): "

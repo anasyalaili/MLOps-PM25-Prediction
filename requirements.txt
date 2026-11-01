@@ -23,8 +23,7 @@ xgboost==3.4.1
 mlflow==3.16.1
 
 # Data Versioning
-dvc==3.67.1
-dvc[webdav]==3.0.1
+dvc[webdav]==3.67.1
 
 # Interactive Notebook
 ipykernel==7.3.0
