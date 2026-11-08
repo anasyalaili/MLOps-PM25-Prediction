@@ -172,7 +172,10 @@ data/processed/
  
 # MLflow
 mlflow.db
+mlflow-ci.db
+.mlflow_store_etag
 mlruns/
+test-results.xml
 mlartifacts/
  
 # Docker

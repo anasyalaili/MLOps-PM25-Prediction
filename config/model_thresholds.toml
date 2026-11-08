@@ -1,0 +1,33 @@
+# Ambang validasi model untuk gate CI (src/evaluate_model.py).
+#
+# Target awal proyek (RMSE <= 15, MAE <= 10) tidak realistis untuk data ini: pada
+# eksperimen terbaik CV RMSE 315 ug/m3 dan baseline "jam yang sama kemarin"
+# sendiri 354, karena PM2.5 saat kebakaran mencapai ratusan ug/m3. Target itu
+# sudah direvisi menjadi perbandingan terhadap baseline musiman (lihat README). Gate di bawah
+# memakai kriteria yang bisa dicapai (diblokir bila gagal), sedangkan target
+# awal proyek hanya dilaporkan sebagai informasi.
+
+# Syarat wajib. Model baru tidak didaftarkan jika salah satunya gagal.
+[blocking]
+# CV RMSE harus lebih rendah dari baseline musiman dengan selisih relatif
+# minimal ini (0.0 = cukup lebih rendah; 0.05 = minimal 5% lebih baik).
+min_cv_improvement_vs_seasonal = 0.0
+# Pecahan fold walk-forward yang harus dimenangkan melawan baseline musiman.
+min_fold_win_ratio = 0.75
+# Champion-challenger (rancangan awal proyek): dibandingkan dengan model Production
+# pada holdout 7 hari terakhir yang sama. Dilewati jika belum ada Production.
+require_lower_rmse_than_production = true
+# Perbaikan RMSE relatif minimal terhadap Production agar dianggap lebih
+# rendah (0.0 = cukup lebih rendah; 0.01 = minimal 1% lebih baik). Selisih
+# di bawah 1e-6 ug/m3 selalu dianggap sama, sehingga model yang identik
+# (dilatih ulang pada data yang sama) tidak didaftarkan sebagai versi baru.
+min_rmse_improvement_vs_production = 0.0
+# Batas penurunan precision kelas Unhealthy (>150 ug/m3) terhadap Production.
+# 0.0 berarti precision tidak boleh turun sama sekali.
+max_precision_drop_vs_production = 0.0
+
+# Target awal proyek, hanya informatif (tidak memblokir).
+[targets]
+rmse = 15.0
+mae = 10.0
+recall_unhealthy = 0.85
