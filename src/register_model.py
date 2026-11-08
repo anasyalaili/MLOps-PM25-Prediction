@@ -83,6 +83,13 @@ def parse_arguments(argv=None):
     reg.add_argument("--run-name", help="Nama run (alternatif --run-id).")
     reg.add_argument("--experiment", default=DEFAULT_EXPERIMENT)
     reg.add_argument("--description", help="Deskripsi versi model.")
+    reg.add_argument(
+        "--tag",
+        action="append",
+        default=[],
+        metavar="KEY=VALUE",
+        help="Tag versi model (boleh diulang), mis. data_version=data-v4.",
+    )
 
     pro = sub.add_parser("promote", help="Ubah stage sebuah versi.")
     pro.add_argument("--version", type=int, required=True)
@@ -176,6 +183,17 @@ def command_register(client, args):
         client.update_model_version(
             args.model_name, version.version, args.description
         )
+    for item in args.tag:
+        key, separator, value = item.partition("=")
+        if not separator or not key:
+            raise ValueError(f"--tag harus berbentuk KEY=VALUE: '{item}'")
+        client.set_model_version_tag(
+            args.model_name, version.version, key, value
+        )
+    output = os.getenv("GITHUB_OUTPUT")
+    if output:
+        with open(output, "a", encoding="utf-8") as handle:
+            handle.write(f"version={version.version}\n")
     print(
         f"Terdaftar: {args.model_name} versi {version.version} (run {run_id})"
     )
