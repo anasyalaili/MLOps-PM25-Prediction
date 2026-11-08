@@ -1,0 +1,390 @@
+name: MLOps Automation
+
+# Rantai otomatis: (lint + test) -> train -> evaluate -> registry (Staging).
+# Tahap 1 (lint dan test) berjalan untuk push dan pull request. Untuk push
+# ke main, tahap 2 (train) dilanjutkan; tahap 3 (evaluate) memutuskan lolos
+# atau tidak, dan tahap 4 (register) hanya berjalan jika evaluasi lolos.
+#
+# Trigger: push ke main dan pull request ke main. Commit pointer data dari
+# workflow ETL memakai "[skip ci]" sehingga tidak memicu workflow ini.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# Satu run per branch/PR. Run PR lama dibatalkan saat ada commit baru;
+# run di main tidak dibatalkan agar riwayat tetap utuh.
+concurrency:
+  group: mlops-automation-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+env:
+  PYTHON_VERSION: "3.14"
+
+jobs:
+  lint:
+    name: Tahap 1 - Lint (black dan flake8)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      # Versi sama dengan requirements.txt, tanpa menginstal seluruh paket.
+      - name: Install black dan flake8
+        run: pip install black==26.5.1 flake8==7.4.1
+
+      # Konfigurasi ada di pyproject.toml (black) dan .flake8.
+      - name: Cek format (black)
+        run: black --check src tests
+
+      - name: Cek gaya kode (flake8)
+        run: flake8 src tests
+
+  test:
+    name: Tahap 1 - Automated Testing
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      # Konfigurasi pytest (folder tes dan path src) ada di pyproject.toml.
+      # Tes tidak memakai jaringan maupun secret, sehingga aman dijalankan
+      # juga pada pull request.
+      - name: Jalankan pytest
+        run: pytest --junitxml=test-results.xml
+
+      - name: Upload hasil tes
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results-${{ github.run_id }}
+          path: test-results.xml
+          retention-days: 7
+
+  train:
+    name: Tahap 2 - Automated Training
+    needs: [lint, test]
+    # Training menulis ke store MLflow bersama, jadi hanya dijalankan untuk
+    # push ke main dan run manual, bukan untuk pull request.
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    # Store MLflow di Nextcloud hanya boleh dipakai satu pipeline sekaligus.
+    concurrency:
+      group: mlflow-ci-store
+      cancel-in-progress: false
+    outputs:
+      run_name: ${{ steps.train.outputs.run_name }}
+      data_version: ${{ steps.train.outputs.data_version }}
+    env:
+      MLFLOW_DISABLE_AGENT_HINT: "1"
+      MLFLOW_EXPERIMENT: pm25-karhutla-h6-ci
+      # Konfigurasi champion (Run 18): ExtraTrees, target delta, tanpa hotspot.
+      TRAIN_ARGS: >-
+        --model extra --n-estimators 300 --max-depth 12
+        --min-samples-leaf 10 --max-features 0.5
+        --target-mode delta --no-hotspot --cv-folds 4
+
+    steps:
+      # fetch-depth 0: dibutuhkan agar git describe dapat membaca tag data-v*.
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      # Remote DVC (data) dan folder store MLflow memakai Nextcloud yang sama.
+      # Folder store dibuat sejajar dengan folder DVC: .../mlflow_store.
+      - name: Konfigurasi Nextcloud
+        env:
+          NEXTCLOUD_USER: ${{ secrets.NEXTCLOUD_USER }}
+          NEXTCLOUD_APP_PASSWORD: ${{ secrets.NEXTCLOUD_APP_PASSWORD }}
+        run: |
+          dvc remote modify --local nextcloud user "$NEXTCLOUD_USER"
+          dvc remote modify --local nextcloud password \
+            "$NEXTCLOUD_APP_PASSWORD"
+          BASE=$(dvc config remote.nextcloud.url \
+            | sed -e 's#^webdavs://#https://#' -e 's#/[^/]*$#/mlflow_store#')
+          echo "MLFLOW_STORE_URL=$BASE" >> "$GITHUB_ENV"
+
+      # Data terbaru = pointer data/processed.dvc pada commit yang di-checkout.
+      - name: Pull dataset processed (DVC)
+        run: dvc pull data/processed.dvc
+
+      - name: Pull store MLflow dari Nextcloud
+        env:
+          NEXTCLOUD_USER: ${{ secrets.NEXTCLOUD_USER }}
+          NEXTCLOUD_APP_PASSWORD: ${{ secrets.NEXTCLOUD_APP_PASSWORD }}
+        run: python src/mlflow_store.py pull
+
+      - name: Training
+        id: train
+        run: |
+          DATA_VERSION=$(git describe --tags --match 'data-v*' 2>/dev/null \
+            || echo unknown)
+          RUN_NAME="ci-${GITHUB_RUN_ID}-${GITHUB_SHA::7}"
+          echo "run_name=$RUN_NAME" >> "$GITHUB_OUTPUT"
+          echo "data_version=$DATA_VERSION" >> "$GITHUB_OUTPUT"
+          python src/train.py --data data/processed \
+            --tracking-uri sqlite:///mlflow-ci.db \
+            --experiment "$MLFLOW_EXPERIMENT" \
+            --run-name "$RUN_NAME" \
+            --data-version "$DATA_VERSION" \
+            $TRAIN_ARGS
+
+      - name: Ringkasan hasil training
+        env:
+          RUN_NAME: ${{ steps.train.outputs.run_name }}
+        run: |
+          python - <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import os
+          import mlflow
+
+          mlflow.set_tracking_uri("sqlite:///mlflow-ci.db")
+          runs = mlflow.search_runs(
+              experiment_names=[os.environ["MLFLOW_EXPERIMENT"]],
+              filter_string=f"tags.mlflow.runName = '{os.environ['RUN_NAME']}'",
+          )
+          run = runs.iloc[0]
+          print("### Hasil training CI")
+          print(f"- Run: `{os.environ['RUN_NAME']}`")
+          print(f"- Versi data: `{run['tags.data_version']}`")
+          print(f"- Commit: `{run['tags.git_commit'][:10]}`")
+          rows = [
+              ("CV RMSE", "metrics.cv_rmse_mean", "metrics.cv_rmse_std"),
+              ("CV RMSE baseline musiman", "metrics.cv_seasonal_rmse_mean", None),
+              ("Fold menang vs baseline", "metrics.cv_rmse_wins_vs_seasonal", None),
+              ("Test RMSE", "metrics.test_rmse", None),
+              ("Test precision >150", "metrics.test_gt150_precision", None),
+              ("Test recall >150", "metrics.test_gt150_recall", None),
+          ]
+          print()
+          print("| Metrik | Nilai |")
+          print("|---|---|")
+          for label, key, spread in rows:
+              text = f"{run[key]:.3f}"
+              if spread:
+                  text += f" ± {run[spread]:.3f}"
+              print(f"| {label} | {text} |")
+          PY
+
+      # Hapus artefak model lama yang tidak terdaftar agar arsip tidak
+      # membengkak (satu model sekitar 40 MB), lalu simpan store.
+      - name: Prune dan push store MLflow ke Nextcloud
+        env:
+          NEXTCLOUD_USER: ${{ secrets.NEXTCLOUD_USER }}
+          NEXTCLOUD_APP_PASSWORD: ${{ secrets.NEXTCLOUD_APP_PASSWORD }}
+        run: |
+          python src/mlflow_store.py prune --keep-recent 2
+          python src/mlflow_store.py push
+
+  evaluate:
+    name: Tahap 3 - Model Evaluation & Validation
+    needs: train
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    concurrency:
+      group: mlflow-ci-store
+      cancel-in-progress: false
+    outputs:
+      passed: ${{ steps.gate.outputs.passed }}
+    env:
+      MLFLOW_DISABLE_AGENT_HINT: "1"
+      MLFLOW_EXPERIMENT: pm25-karhutla-h6-ci
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      # Remote DVC (data) dan folder store MLflow memakai Nextcloud yang sama.
+      - name: Konfigurasi Nextcloud
+        env:
+          NEXTCLOUD_USER: ${{ secrets.NEXTCLOUD_USER }}
+          NEXTCLOUD_APP_PASSWORD: ${{ secrets.NEXTCLOUD_APP_PASSWORD }}
+        run: |
+          dvc remote modify --local nextcloud user "$NEXTCLOUD_USER"
+          dvc remote modify --local nextcloud password \
+            "$NEXTCLOUD_APP_PASSWORD"
+          BASE=$(dvc config remote.nextcloud.url \
+            | sed -e 's#^webdavs://#https://#' -e 's#/[^/]*$#/mlflow_store#')
+          echo "MLFLOW_STORE_URL=$BASE" >> "$GITHUB_ENV"
+
+      - name: Pull dataset processed (DVC)
+        run: dvc pull data/processed.dvc
+
+      - name: Pull store MLflow dari Nextcloud
+        env:
+          NEXTCLOUD_USER: ${{ secrets.NEXTCLOUD_USER }}
+          NEXTCLOUD_APP_PASSWORD: ${{ secrets.NEXTCLOUD_APP_PASSWORD }}
+        run: python src/mlflow_store.py pull
+
+      # Ambang ada di config/model_thresholds.toml. Hasil gate (lolos atau
+      # tidak) menjadi output job; job ini sendiri tetap berhasil selama
+      # evaluasi berjalan, dan registrasi dilewati jika tidak lolos.
+      - name: Evaluasi dan validasi model
+        id: gate
+        env:
+          RUN_NAME: ${{ needs.train.outputs.run_name }}
+        run: |
+          python src/evaluate_model.py \
+            --tracking-uri sqlite:///mlflow-ci.db \
+            --experiment "$MLFLOW_EXPERIMENT" \
+            --run-name "$RUN_NAME" \
+            --thresholds config/model_thresholds.toml \
+            --report evaluation.json
+
+      - name: Upload laporan evaluasi
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: evaluation-${{ github.run_id }}
+          path: evaluation.json
+          if-no-files-found: ignore
+          retention-days: 30
+
+      # Keputusan gate dicatat sebagai tag pada run, jadi store disimpan lagi.
+      - name: Push store MLflow ke Nextcloud
+        env:
+          NEXTCLOUD_USER: ${{ secrets.NEXTCLOUD_USER }}
+          NEXTCLOUD_APP_PASSWORD: ${{ secrets.NEXTCLOUD_APP_PASSWORD }}
+        run: python src/mlflow_store.py push
+
+  register:
+    name: Tahap 4 - Auto Registry Update (Staging)
+    needs: [train, evaluate]
+    if: needs.evaluate.outputs.passed == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    concurrency:
+      group: mlflow-ci-store
+      cancel-in-progress: false
+    env:
+      MLFLOW_DISABLE_AGENT_HINT: "1"
+      MLFLOW_EXPERIMENT: pm25-karhutla-h6-ci
+      REGISTRY: python src/register_model.py --tracking-uri sqlite:///mlflow-ci.db
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      # Remote DVC (data) dan folder store MLflow memakai Nextcloud yang sama.
+      - name: Konfigurasi Nextcloud
+        env:
+          NEXTCLOUD_USER: ${{ secrets.NEXTCLOUD_USER }}
+          NEXTCLOUD_APP_PASSWORD: ${{ secrets.NEXTCLOUD_APP_PASSWORD }}
+        run: |
+          dvc remote modify --local nextcloud user "$NEXTCLOUD_USER"
+          dvc remote modify --local nextcloud password \
+            "$NEXTCLOUD_APP_PASSWORD"
+          BASE=$(dvc config remote.nextcloud.url \
+            | sed -e 's#^webdavs://#https://#' -e 's#/[^/]*$#/mlflow_store#')
+          echo "MLFLOW_STORE_URL=$BASE" >> "$GITHUB_ENV"
+
+      - name: Pull dataset processed (DVC)
+        run: dvc pull data/processed.dvc
+
+      - name: Pull store MLflow dari Nextcloud
+        env:
+          NEXTCLOUD_USER: ${{ secrets.NEXTCLOUD_USER }}
+          NEXTCLOUD_APP_PASSWORD: ${{ secrets.NEXTCLOUD_APP_PASSWORD }}
+        run: python src/mlflow_store.py pull
+
+      - name: Daftarkan model ke registry
+        id: register
+        env:
+          RUN_NAME: ${{ needs.train.outputs.run_name }}
+          DATA_VERSION: ${{ needs.train.outputs.data_version }}
+        run: |
+          $REGISTRY register \
+            --experiment "$MLFLOW_EXPERIMENT" \
+            --run-name "$RUN_NAME" \
+            --description "CI run $GITHUB_RUN_ID, commit ${GITHUB_SHA::7}, data $DATA_VERSION" \
+            --tag "data_version=$DATA_VERSION" \
+            --tag "git_commit=$GITHUB_SHA" \
+            --tag "ci_run_id=$GITHUB_RUN_ID" \
+            --tag "source=github-actions"
+
+      # Model baru masuk Staging (alias staging ikut ditetapkan) dan versi
+      # Staging sebelumnya diarsipkan, sehingga hanya ada satu Staging aktif.
+      # Promosi ke Production tetap keputusan manusia.
+      - name: Pindahkan ke Staging
+        env:
+          VERSION: ${{ steps.register.outputs.version }}
+        run: |
+          $REGISTRY promote --version "$VERSION" --stage Staging \
+            --archive-existing --alias
+
+      - name: Verifikasi inferensi model Staging
+        run: $REGISTRY verify --alias staging --data data/processed --rows 3
+
+      - name: Ringkasan registry
+        run: |
+          {
+            echo "### Registry model"
+            echo '```'
+            $REGISTRY list
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Prune dan push store MLflow ke Nextcloud
+        env:
+          NEXTCLOUD_USER: ${{ secrets.NEXTCLOUD_USER }}
+          NEXTCLOUD_APP_PASSWORD: ${{ secrets.NEXTCLOUD_APP_PASSWORD }}
+        run: |
+          python src/mlflow_store.py prune --keep-recent 2
+          python src/mlflow_store.py push
