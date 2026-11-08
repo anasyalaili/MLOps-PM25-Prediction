@@ -25,5 +25,8 @@ mlflow==3.16.1
 # Data Versioning
 dvc[webdav]==3.67.1
 
+# Testing
+pytest==9.2.0
+
 # Interactive Notebook
 ipykernel==7.3.0
