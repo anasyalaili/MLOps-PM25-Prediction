@@ -17,9 +17,10 @@ Berbeda dari pendekatan prediksi AQI konvensional yang hanya mengandalkan data c
 | Pengambilan data (Open-Meteo, NASA FIRMS), termasuk backfill historis | Berjalan; otomatis tiap 3 jam lewat GitHub Actions |
 | Pembersihan dan feature engineering | Berjalan; otomatis mingguan lewat GitHub Actions |
 | Versioning data (DVC, remote Nextcloud) | Berjalan |
-| Training dan pelacakan eksperimen (MLflow) | Berjalan; dijalankan manual |
-| Model Registry (registrasi, stage, silsilah, inferensi) | Berjalan; dijalankan manual lewat `src/register_model.py` |
-| Retraining otomatis berdasarkan jadwal atau drift | Belum diimplementasi |
+| Training dan pelacakan eksperimen (MLflow) | Berjalan; eksperimen dijalankan manual, dan training otomatis di CI pada setiap push ke `main` |
+| Model Registry (registrasi, stage, silsilah, inferensi) | Berjalan; manual lewat `src/register_model.py`, dan model yang lolos gate evaluasi masuk Staging otomatis lewat CI |
+| CI/CD (lint, tes, training, evaluasi, registry Staging) | Tersedia lewat GitHub Actions (`mlops-automation.yaml`) |
+| Retraining terjadwal atau berbasis drift | Belum diimplementasi (training otomatis baru dipicu oleh push ke `main`) |
 | Serving model (API), monitoring, dan containerization | Belum diimplementasi |
 
 Hasil terbaik saat ini: ExtraTrees dengan target selisih (`delta`) dan 28 fitur
@@ -71,7 +72,8 @@ sudah siap (lihat *Cara Menjalankan via GitHub Codespaces*).
 - [Eksperimen Training dan MLflow](#eksperimen-training-dan-mlflow)
 - [Model Registry](#model-registry-mlflow)
 - [Alur Lengkap](#alur-lengkap)
-- [Standar Kode](#standar-kode-pep-8), [Branching](#branching-strategy), [Tech Stack](#tech-stack), [Sumber Data](#sumber-data)
+- [CI/CD: MLOps Automation](#cicd-mlops-automation-github-actions)
+- [Standar Kode](#standar-kode-pep-8), [Pengujian](#pengujian-pytest), [Pemecahan Masalah](#pemecahan-masalah), [Branching](#branching-strategy), [Tech Stack](#tech-stack), [Sumber Data](#sumber-data)
 
 ## Struktur Direktori
 ```
@@ -79,7 +81,8 @@ MLOps-PM25-Prediction/
 ├── .github/
 │   └── workflows/
 │       ├── etl_pipeline.yml          # ingestion tiap 3 jam
-│       └── etl_transform_load.yml    # transform dan load mingguan
+│       ├── etl_transform_load.yml    # transform dan load mingguan
+│       └── mlops-automation.yaml     # CI: tes otomatis (push dan pull request)
 ├── .devcontainer/
 │   └── devcontainer.json
 ├── .dvc/
@@ -95,7 +98,12 @@ MLOps-PM25-Prediction/
 │   ├── preprocess.py
 │   ├── build_features.py
 │   ├── train.py
-│   └── register_model.py
+│   ├── register_model.py
+│   ├── evaluate_model.py
+│   └── mlflow_store.py
+├── config/
+│   └── model_thresholds.toml         # ambang gate evaluasi model (CI)
+├── tests/                            # tes pytest
 ├── .dvcignore
 ├── .flake8
 ├── .gitignore
@@ -113,6 +121,7 @@ File dan folder berikut dibuat saat dijalankan dan tidak masuk Git:
 | `.env` | `FIRMS_MAP_KEY` |
 | `.dvc/config.local`, `.dvc/cache` | Kredensial Nextcloud dan cache DVC lokal |
 | `mlflow.db`, `mlruns/` | Backend SQLite dan artefak MLflow |
+| `mlflow-ci.db`, `.mlflow_store_etag` | Salinan lokal store MLflow milik CI (hanya ada jika diunduh) |
 | `models/registry/` | Metadata model (JSON), dilacak DVC lewat `models/registry.dvc` |
 | `logs/` | Log ingestion harian |
 
@@ -124,7 +133,7 @@ Proyek ini menggunakan GitHub Codespaces sebagai *cloud development environment*
 2. Klik tombol **Code** (hijau) di kanan atas
 3. Pilih tab **Codespaces**, lalu klik **Create codespace on main**
 4. Tunggu beberapa menit — Codespace akan otomatis:
-   - Menyiapkan environment Python 3.11
+   - Menyiapkan environment Python 3.14
    - Menginstall semua dependency dari `requirements.txt`
    - Menginstall extension VS Code yang dibutuhkan (Python, Docker, GitHub Actions)
 5. Setelah selesai, langsung jalankan script tanpa instalasi tambahan (lihat bagian *Alur Lengkap* di bawah).
@@ -133,7 +142,7 @@ Port berikut sudah otomatis di-forward untuk kebutuhan tahap selanjutnya (MLflow
 
 ## Instalasi Dependencies
 
-**Prasyarat:** Python 3.11 atau lebih baru (versi `pandas` dan `numpy` di `requirements.txt` tidak mendukung Python 3.10).
+**Prasyarat:** Python 3.14. Versi paket di `requirements.txt` diuji pada Python 3.14 (`numpy==2.5.3` sendiri membutuhkan Python 3.12 atau lebih baru, jadi Python 3.11 tidak bisa dipakai).
 
 Di **GitHub Codespaces**, dependency terinstall otomatis lewat `.devcontainer/devcontainer.json`. Untuk **komputer lokal**, gunakan virtual environment:
 
@@ -156,7 +165,8 @@ pip install -r requirements.txt
 | `mlflow` | Pencatatan eksperimen dan model | `train.py` |
 | `matplotlib` | Grafik feature importance (opsional, dilewati jika tidak ada) | `train.py` |
 | `dvc[webdav]` | Versioning data dengan remote Nextcloud | seluruh pipeline data |
-| `black`, `flake8` | Auto-format dan linter PEP 8 | pengembangan |
+| `black`, `flake8` | Auto-format dan linter PEP 8 | pengembangan, job `lint` di CI |
+| `pytest` | Pengujian otomatis | `tests/`, job `test` di CI |
 | `ipykernel` | Kernel Jupyter | notebook |
 
 Library `haversine` ada di `requirements.txt` tetapi belum dipakai: jarak
@@ -368,6 +378,10 @@ Actions, New repository secret**:
 | `NEXTCLOUD_USER` | Username Nextcloud | `user` di `.dvc/config.local` |
 | `NEXTCLOUD_APP_PASSWORD` | App password Nextcloud | `password` di `.dvc/config.local` |
 | `FIRMS_MAP_KEY` | MAP_KEY NASA FIRMS | `FIRMS_MAP_KEY` di `.env` |
+
+Pemakaian: `NEXTCLOUD_USER` dan `NEXTCLOUD_APP_PASSWORD` dipakai oleh ketiga
+workflow (ETL dan `mlops-automation.yaml`, untuk data DVC dan store MLflow);
+`FIRMS_MAP_KEY` hanya dipakai oleh ingestion.
 
 Catatan:
 - Disarankan membuat app password Nextcloud khusus GitHub Actions (Settings,
@@ -902,29 +916,153 @@ Lihat *Opsi training* dan *Cara mereproduksi* di bagian eksperimen, dan bagian *
 
 ### 3. Menjalankan workflow GitHub Actions
 
-Workflow hanya muncul di tab **Actions** dan berjalan terjadwal setelah
-file-nya ada di branch `main`.
+Workflow berjalan otomatis (ETL terjadwal, `MLOps Automation` pada push dan pull
+request) dan juga bisa dijalankan manual dari tab **Actions** lewat *Run workflow*:
 
 1. Daftarkan secret dan atur permission (lihat *Setup GitHub Secrets*).
-2. Actions, `ETL Pipeline (Ingestion)`, `Run workflow`. Cek bahwa muncul commit
-   `chore(data): ingestion otomatis ...`.
-3. Actions, `ETL Pipeline (Transform and Load)`, `Run workflow`. Kosongkan
-   `create_tag` untuk uji pertama.
+2. `ETL Pipeline (Ingestion)`: mode `incremental`, atau `backfill` dengan jumlah
+   hari untuk mengisi celah data. Cek bahwa muncul commit `chore(data): ingestion
+   otomatis ...`.
+3. `ETL Pipeline (Transform and Load)`: kosongkan `create_tag` untuk uji pertama.
+4. `MLOps Automation`: menjalankan lint, tes, training, evaluasi, dan registrasi.
 
 Dengan GitHub CLI:
 
 ```bash
 gh workflow run "ETL Pipeline (Ingestion)"
 gh workflow run "ETL Pipeline (Transform and Load)" -f create_tag=false
+gh workflow run "MLOps Automation"
 gh run list --limit 5
 gh run watch
 ```
 
-Urutan mengaktifkan workflow: selesaikan dulu langkah 1 (termasuk backfill
-historis dan tag `data-v4`) lalu push, baru gabungkan workflow ke `main`.
-Setelah aktif, workflow meng-commit `data/raw.dvc` ke `main` tiap 3 jam,
-sehingga pointer `raw.dvc` yang di-commit dari lokal akan bentrok dan harus
-di-`git pull --rebase` dulu.
+Workflow ETL meng-commit `data/raw.dvc` ke `main` tiap 3 jam. Karena itu,
+jalankan `git pull --rebase` sebelum mem-push perubahan yang menyentuh pointer
+data, agar tidak bentrok dengan commit otomatis.
+
+## CI/CD: MLOps Automation (GitHub Actions)
+
+Workflow `.github/workflows/mlops-automation.yaml` menjalankan rantai otomatis
+setiap push ke `main` dan pull request ke `main`:
+
+```
+push ke main:  (lint + test) -> train -> evaluate -> register (Staging, jika lolos)
+pull request:  lint + test
+```
+
+| Tahap | Job | Kapan | Isi |
+|---|---|---|---|
+| 1 | `lint` | push dan pull request | `black --check` dan `flake8` pada `src` dan `tests` (konfigurasi di `pyproject.toml` dan `.flake8`) |
+| 1 | `test` | push dan pull request | `pytest` pada Python 3.14; hasil `test-results.xml` disimpan sebagai artifact |
+| 2 | `train` | push ke `main` dan run manual, setelah `lint` dan `test` lolos | `dvc pull data/processed.dvc`, training champion dengan data terbaru, ringkasan metrik di tab *Summary* |
+| 3 | `evaluate` | setelah `train` | Gate validasi `src/evaluate_model.py` dengan ambang di `config/model_thresholds.toml`; keputusan menjadi output `passed` dan tag `gate_passed` pada run |
+| 4 | `register` | hanya jika `evaluate` menyatakan lolos | Daftarkan model ke registry, pindahkan ke stage **Staging** (alias `staging`), uji muat lewat `pyfunc`, ringkasan registry |
+
+Konfigurasi training CI ada di `TRAIN_ARGS` pada workflow (champion Run 18:
+ExtraTrees, target `delta`, tanpa hotspot). Hasilnya dicatat di experiment
+`pm25-karhutla-h6-ci`, dengan nama run `ci-<id run>-<commit>` dan tag
+`data_version` dari `git describe` pada tag `data-v*`.
+
+### Gate evaluasi (tahap 3)
+
+Ambang ada di `config/model_thresholds.toml` dan bisa diubah tanpa menyentuh kode.
+
+| Pemeriksaan | Sifat | Aturan default |
+|---|---|---|
+| CV RMSE lebih baik dari baseline musiman | Wajib | Lebih rendah dari baseline "jam yang sama kemarin" (selisih minimal diatur `min_cv_improvement_vs_seasonal`) |
+| Menang di mayoritas fold | Wajib | Minimal 75% fold walk-forward lebih baik dari baseline |
+| RMSE holdout lebih rendah dari Production | Wajib, hanya jika sudah ada model Production | Model baru dan Production dievaluasi ulang pada holdout 7 hari terakhir yang sama; RMSE baru harus lebih rendah (selisih di bawah 1e-6 dianggap sama, jadi model identik tidak didaftarkan ulang) |
+| Precision kelas >150 tidak turun | Wajib, hanya jika sudah ada Production | Tidak boleh turun terhadap Production |
+| RMSE, MAE, recall kelas >150 sesuai target awal proyek | Informasi saja | Ditampilkan di ringkasan, tidak memblokir |
+
+Alasan target awal proyek (RMSE <= 15, MAE <= 10) tidak dijadikan syarat wajib:
+pada data ini CV RMSE terbaik 315,3 dan baseline musiman sendiri 354,3, karena
+PM2.5 saat kebakaran mencapai ratusan ug/m3. Target tersebut sudah direvisi
+menjadi perbandingan terhadap baseline musiman, yang dipakai gate ini. Aturan
+champion-challenger mengikuti rancangan awal proyek (model baru dipromosikan
+hanya jika RMSE lebih rendah dan precision kelas Unhealthy tidak turun).
+
+Jika gate tidak lolos, job `evaluate` tetap berhasil (evaluasi selesai dijalankan)
+dan memberi peringatan; job `register` dilewati. Laporan lengkap tersimpan sebagai
+artifact `evaluation-<id run>` (JSON) dan tabelnya muncul di tab *Summary*.
+
+### Registry otomatis (tahap 4)
+
+Model yang lolos didaftarkan ke registry store CI dengan deskripsi dan tag
+`data_version`, `git_commit`, `ci_run_id`, dan `source=github-actions`, lalu
+dipindahkan ke **Staging** (versi Staging sebelumnya otomatis diarsipkan). Promosi
+ke **Production** tetap keputusan manusia:
+
+```bash
+# setelah mengunduh store CI (lihat di bawah)
+python src/register_model.py --tracking-uri sqlite:///mlflow-ci.db list
+python src/register_model.py --tracking-uri sqlite:///mlflow-ci.db promote \
+    --version 1 --stage Production --alias
+python src/mlflow_store.py push
+```
+
+Setelah ada model Production, pipeline berikutnya membandingkan model baru
+dengannya. Melatih ulang model yang sama pada data yang sama tidak lolos gate
+(tidak ada perbaikan), dan itu perilaku yang diharapkan.
+
+### Simulasi perubahan (menjalankan rantai dari awal sampai akhir)
+
+Prasyarat satu kali: secret `NEXTCLOUD_USER` dan `NEXTCLOUD_APP_PASSWORD`
+terdaftar, *Workflow permissions* diatur, dan branch yang berisi workflow sudah
+di-merge ke `main` (lihat *Setup GitHub Secrets*).
+
+1. Buat branch, lakukan perubahan kecil (misalnya ubah teks komentar, atau
+   ubah `--n-estimators` di `TRAIN_ARGS`), commit, dan push.
+2. Buka pull request: hanya tahap 1 (`test`) yang berjalan. Pastikan hijau.
+3. Merge ke `main`: seluruh rantai berjalan. Pantau di tab **Actions** pada
+   run `MLOps Automation`: graf job menunjukkan `test`, `train`, `evaluate`,
+   dan `register` berurutan; tab *Summary* menampilkan metrik training, tabel
+   gate, dan isi registry.
+4. Pada run pertama belum ada model Production, sehingga model yang lolos
+   baseline langsung masuk Staging. Unduh store CI (di bawah) untuk melihat
+   versi dan stage-nya di MLflow UI.
+5. Untuk melihat gate champion-challenger bekerja, promosikan versi itu ke
+   Production, lalu ubah kode atau hiperparameter dan push lagi: model baru
+   hanya masuk Staging jika benar-benar lebih baik.
+
+### Store MLflow untuk CI
+
+Runner GitHub bersifat sementara, sedangkan registry model harus bertahan.
+Store MLflow khusus CI (`mlflow-ci.db` dan `mlruns/`) karena itu disimpan
+sebagai satu arsip di Nextcloud (folder `mlflow_store`, sejajar dengan
+`dvc_storage`) dan dikelola oleh `src/mlflow_store.py`:
+
+| Perintah | Fungsi |
+|---|---|
+| `pull` | Unduh dan ekstrak store di awal job (run pertama mulai dari kosong) |
+| `prune --keep-recent 2` | Hapus artefak model yang tidak terdaftar di registry dan bukan 2 model terbaru (satu model sekitar 40 MB) |
+| `push` | Kemas dan unggah store di akhir job |
+
+Pengaman: saat `pull`, ETag arsip dicatat; saat `push`, ETag itu dikirim sebagai
+`If-Match`. Jika ada pihak lain yang mengubah arsip di antaranya, unggahan
+ditolak (HTTP 412) dan job gagal, bukan menimpa diam-diam. Job `train`
+memakai `concurrency` (`mlflow-ci-store`) sehingga dua pipeline tidak memakai
+store bersamaan.
+
+Store CI terpisah dari `mlflow.db` lokal, jadi eksperimen lokal tidak bisa
+menimpa registry CI. Untuk melihat hasil CI di MLflow UI:
+
+```bash
+export NEXTCLOUD_USER=<username> NEXTCLOUD_APP_PASSWORD=<app-password>
+export MLFLOW_STORE_URL=https://<host>/remote.php/dav/files/<user>/mlflow_store
+python src/mlflow_store.py pull
+mlflow ui --backend-store-uri sqlite:///mlflow-ci.db --port 5001
+```
+
+Catatan:
+- Secret yang dipakai sama dengan workflow ETL: `NEXTCLOUD_USER` dan
+  `NEXTCLOUD_APP_PASSWORD` (lihat *Setup GitHub Secrets*).
+- MLflow menyimpan path absolut artefak. Path workspace runner GitHub selalu
+  sama antar run sehingga model bisa dimuat di CI, tetapi di komputer lokal
+  hanya metadata (run, metrik, registry) yang terbaca; artefak model CI tidak
+  bisa dimuat dari salinan lokal.
+- Pull request tidak menyentuh store ini; hanya push ke `main` dan run manual
+  yang menulis ke Nextcloud.
 
 ## Standar Kode (PEP 8)
 
@@ -934,6 +1072,57 @@ Kode mengikuti PEP 8: nama variabel deskriptif, docstring pada setiap modul dan 
 black src/           # format otomatis
 flake8 src/          # cek kepatuhan PEP 8
 ```
+
+## Pengujian (pytest)
+
+Tes ada di folder `tests/` dan mencakup ingestion, prapemrosesan, feature
+engineering, training, dan registry. Tes tidak memakai jaringan maupun secret;
+data yang dipakai berupa data sintetis kecil, dan MLflow ditulis ke folder
+sementara.
+
+```bash
+pip install -r requirements.txt
+pytest                       # semua tes, sekitar 1 sampai 2 menit
+pytest tests/test_train.py   # satu berkas
+pytest -k hotspot            # tes yang namanya memuat "hotspot"
+```
+
+| Berkas | Yang diuji |
+|---|---|
+| `test_ingest_data.py` | Validasi tanggal mode `historical`, rencana request FIRMS, nama file `hist`, retry dengan backoff, 4xx tidak diulang |
+| `test_preprocess.py` | Urutan file `hist` (data live menang), deduplikasi, filter confidence, validasi rentang, konversi UTC ke WIB |
+| `test_build_features.py` | Skema 39 kolom, hitungan hotspot (dibandingkan perhitungan manual), label 6 jam ke depan, lag, tidak ada kebocoran dari masa depan |
+| `test_train.py` | Transformasi target, pemilihan fitur, split kronologis, metrik, semua jenis model, satu run training sampai tercatat di MLflow |
+| `test_register_model.py` | Siklus registry penuh: register, promote, archive, metadata, verify, active |
+| `test_evaluate_model.py` | Logika gate (baseline musiman, champion-challenger, toleransi), laporan, dan alur evaluasi pada store sementara |
+| `test_mlflow_store.py` | Sinkronisasi store ke WebDAV (server palsu, ETag, konflik) dan pruning artefak model |
+
+Konfigurasi pytest ada di `pyproject.toml`. Workflow
+`.github/workflows/mlops-automation.yaml` menjalankan tes yang sama pada setiap
+push ke `main` dan setiap pull request ke `main` (Python 3.14), lalu
+menyimpan hasilnya (`test-results.xml`) sebagai artifact selama 7 hari. Job
+`lint` berjalan bersamaan dan memeriksa gaya kode.
+
+Sebelum commit yang menyentuh kode Python, jalankan pemeriksaan yang sama di
+lokal agar job `lint` tidak merah:
+
+```bash
+black src tests              # merapikan format
+flake8 src tests             # memeriksa pelanggaran PEP 8
+```
+
+## Pemecahan Masalah
+
+| Gejala | Penyebab dan solusi |
+|---|---|
+| `pip install -r requirements.txt` gagal di `numpy` | Python di bawah 3.12. Gunakan Python 3.14 (di Codespaces: *Rebuild Container* setelah `devcontainer.json` terbaru) |
+| Pesan `git-lfs was not found on your path` saat `checkout` atau `push` | Hook Git LFS ada tetapi program tidak terpasang, sedangkan repositori ini tidak memakai LFS. Pasang dengan `sudo apt-get install -y git-lfs && git lfs install` (Mac: `brew install git-lfs`) |
+| Codespace masuk *recovery mode* | Build container gagal. Buka *Codespaces: View Creation Log*, perbaiki `devcontainer.json`, lalu *Rebuild Container* |
+| Error koneksi saat mengambil data FIRMS | Gangguan jaringan atau server lambat (batas waktu 30 detik per permintaan). Ulangi; run yang gagal tidak meninggalkan berkas FIRMS setengah jadi. Cek `logs/ingestion_YYYYMMDD.log` |
+| Diff Git menampilkan ratusan baris berubah padahal edit kecil | Indentasi atau baris akhir berubah (mis. akibat paste). Jalankan `black src tests`, lalu periksa `git diff -w` |
+| Branch lama tidak punya perubahan terbaru | Branch menyimpan keadaan saat dibuat. Buat branch baru dari `main` setelah `git pull` |
+| Artefak model dari store CI tidak bisa dimuat di komputer lokal | MLflow menyimpan path absolut runner GitHub. Metadata, metrik, dan registry tetap terbaca |
+| Job `evaluate` menyatakan tidak lolos padahal modelnya sama | Perilaku yang diharapkan: model yang identik dengan Production tidak lebih baik, jadi tidak didaftarkan ulang |
 
 ## Branching Strategy
 
