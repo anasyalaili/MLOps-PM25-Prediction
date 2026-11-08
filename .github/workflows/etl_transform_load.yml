@@ -1,0 +1,133 @@
+name: ETL Pipeline (Transform and Load)
+
+# Transform (preprocess), feature engineering, dan Load (data/processed)
+# dijalankan mingguan, tiap Senin 00:47 WIB (Minggu 17:47 UTC). Ingestion
+# berjalan tiap 3 jam (etl_pipeline.yml), jadi satu minggu data raw
+# terakumulasi sebelum diproses. Hasilnya diberi tag MINOR baru
+# (data-vX.Y), sesuai skema penomoran versi data di README.
+on:
+  schedule:
+    - cron: "47 17 * * 0"
+  workflow_dispatch:
+    inputs:
+      create_tag:
+        description: "Buat tag data-vX.Y baru jika dataset berubah"
+        type: boolean
+        default: true
+
+# Grup yang sama dengan ingestion: keduanya mengubah pointer DVC di main,
+# jadi tidak boleh berjalan bersamaan.
+concurrency:
+  group: etl-ingestion
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+env:
+  CREATE_TAG: ${{ inputs.create_tag == null && 'true' || inputs.create_tag }}
+
+jobs:
+  transform-load:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      # fetch-depth 0: dibutuhkan untuk membaca semua tag data-v*.
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      # Hanya dependency tahap transform dan load (versi sama dengan
+      # requirements.txt).
+      - name: Install dependencies
+        run: |
+          pip install pandas==3.0.5 numpy==2.5.3 pyarrow==25.0.1 \
+            "dvc[webdav]==3.67.1"
+
+      - name: Konfigurasi remote DVC (Nextcloud)
+        env:
+          NEXTCLOUD_USER: ${{ secrets.NEXTCLOUD_USER }}
+          NEXTCLOUD_APP_PASSWORD: ${{ secrets.NEXTCLOUD_APP_PASSWORD }}
+        run: |
+          dvc remote modify --local nextcloud user "$NEXTCLOUD_USER"
+          dvc remote modify --local nextcloud password \
+            "$NEXTCLOUD_APP_PASSWORD"
+
+      # Hanya raw yang di-pull. data/processed dibangun ulang penuh dari
+      # seluruh raw, sehingga tidak perlu (dan tidak boleh) di-pull.
+      - name: Pull data raw terbaru
+        run: dvc pull data/raw.dvc
+
+      - name: Transform (preprocess)
+        run: python src/preprocess.py
+
+      - name: Feature engineering dan Load (processed)
+        run: python src/build_features.py
+
+      - name: Verifikasi hasil processed
+        run: |
+          count=$(find data/processed -name 'data.parquet' | wc -l)
+          echo "Partisi parquet: $count"
+          if [ "$count" -eq 0 ]; then
+            echo "ERROR: tidak ada partisi parquet di data/processed"
+            exit 1
+          fi
+
+      - name: Lacak dan push data processed ke Nextcloud
+        run: |
+          dvc add data/processed
+          dvc push data/processed.dvc
+
+      # Hanya commit dan tag jika isi dataset benar-benar berubah.
+      - name: Commit pointer dan buat tag
+        run: |
+          if git diff --quiet -- data/processed.dvc; then
+            echo "Tidak ada perubahan pada data/processed.dvc"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email \
+            "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data/processed.dvc
+          git commit -m "chore(data): transform dan load mingguan $(date -u +%Y%m%d) [skip ci]"
+
+          for attempt in 1 2 3; do
+            git pull --rebase origin "${GITHUB_REF_NAME}" \
+              && git push origin "HEAD:${GITHUB_REF_NAME}" && break
+            if [ "$attempt" -eq 3 ]; then
+              echo "Gagal push pointer setelah 3 percobaan"
+              exit 1
+            fi
+            sleep 5
+          done
+
+          if [ "$CREATE_TAG" != "true" ]; then
+            echo "create_tag=false, tag dilewati"
+            exit 0
+          fi
+
+          # Tag MINOR berikutnya dari tag data-v* tertinggi
+          # (data-v3 menjadi data-v3.1, data-v3.1 menjadi data-v3.2).
+          latest=$(git tag -l 'data-v*' --sort=-v:refname | head -n 1)
+          version=${latest#data-v}
+          major=${version%%.*}
+          if [ "$version" = "$major" ]; then
+            minor=0
+          else
+            minor=${version#*.}
+          fi
+          new_tag="data-v${major}.$((minor + 1))"
+          echo "Tag terbaru: $latest, tag baru: $new_tag"
+
+          git tag -a "$new_tag" \
+            -m "Dataset processed otomatis $(date -u +%Y-%m-%d)"
+          git push origin "$new_tag"

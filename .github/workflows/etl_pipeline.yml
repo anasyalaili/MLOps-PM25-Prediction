@@ -1,0 +1,127 @@
+name: ETL Pipeline (Ingestion)
+
+# Ingestion otomatis tiap 3 jam. Menit 17 dipilih (bukan :00/:05) karena
+# cron GitHub Actions sering tertunda di awal jam. Run yang terlewat atau
+# telat tertutup oleh overlap 2 hari di mode incremental ingest_data.py.
+on:
+  schedule:
+    - cron: "17 */3 * * *"
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "Mode ingestion"
+        type: choice
+        options:
+          - incremental
+          - backfill
+        default: incremental
+      backfill_days:
+        description: "Jumlah hari (hanya untuk mode backfill)"
+        default: "30"
+
+# Satu run pada satu waktu, supaya dua run tidak saling menimpa raw.dvc.
+concurrency:
+  group: etl-ingestion
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+env:
+  MODE: ${{ inputs.mode || 'incremental' }}
+  BACKFILL_DAYS: ${{ inputs.backfill_days || '30' }}
+
+jobs:
+  ingest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      # Hanya dependency yang dipakai ingestion dan DVC (versi sama dengan
+      # requirements.txt), supaya tidak menginstall mlflow/xgboost.
+      - name: Install dependencies
+        run: |
+          pip install requests==2.34.2 python-dotenv==1.2.3 \
+            "dvc[webdav]==3.67.1"
+
+      - name: Konfigurasi remote DVC (Nextcloud)
+        env:
+          NEXTCLOUD_USER: ${{ secrets.NEXTCLOUD_USER }}
+          NEXTCLOUD_APP_PASSWORD: ${{ secrets.NEXTCLOUD_APP_PASSWORD }}
+        run: |
+          dvc remote modify --local nextcloud user "$NEXTCLOUD_USER"
+          dvc remote modify --local nextcloud password \
+            "$NEXTCLOUD_APP_PASSWORD"
+
+      # Wajib: runner kosong, sedangkan dvc add data/raw melacak seluruh
+      # folder. Tanpa pull, pointer baru hanya berisi file run ini.
+      - name: Pull data raw terbaru
+        run: dvc pull data/raw.dvc
+
+      # continue-on-error: ingest_data.py exit 1 jika ada sumber gagal,
+      # tetapi file dari sumber yang berhasil tetap harus disimpan.
+      - name: Ingestion
+        id: ingest
+        continue-on-error: true
+        env:
+          FIRMS_MAP_KEY: ${{ secrets.FIRMS_MAP_KEY }}
+        run: |
+          if [ "$MODE" = "backfill" ]; then
+            python src/ingest_data.py --mode backfill \
+              --backfill-days "$BACKFILL_DAYS"
+          else
+            python src/ingest_data.py
+          fi
+
+      - name: Lacak dan push data ke Nextcloud
+        run: |
+          dvc add data/raw
+          dvc push data/raw.dvc
+
+      # Pointer harus di-commit, kalau tidak data yang di-push yatim
+      # (run berikutnya akan pull dari pointer lama).
+      - name: Commit pointer data/raw.dvc
+        run: |
+          if git diff --quiet -- data/raw.dvc; then
+            echo "Tidak ada perubahan pada data/raw.dvc"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email \
+            "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data/raw.dvc
+          git commit -m "chore(data): ingestion otomatis $(date -u +%Y%m%d_%H%M) [skip ci]"
+          for attempt in 1 2 3; do
+            git pull --rebase origin "${GITHUB_REF_NAME}" \
+              && git push origin "HEAD:${GITHUB_REF_NAME}" && exit 0
+            sleep 5
+          done
+          echo "Gagal push pointer setelah 3 percobaan"
+          exit 1
+
+      - name: Upload log ingestion
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ingestion-logs-${{ github.run_id }}
+          path: logs/
+          if-no-files-found: ignore
+          retention-days: 7
+
+      # Job ditandai gagal jika ada sumber yang gagal, setelah data dari
+      # sumber yang berhasil sempat tersimpan.
+      - name: Tandai gagal jika ingestion tidak lengkap
+        if: steps.ingest.outcome == 'failure'
+        run: |
+          echo "Ada sumber yang gagal, lihat artifact log."
+          exit 1
