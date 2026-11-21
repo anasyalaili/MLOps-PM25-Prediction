@@ -25,6 +25,11 @@ mlflow==3.16.1
 # Data Versioning
 dvc[webdav]==3.67.1
 
+# Serving API (src/serve.py) dan kliennya untuk tes
+fastapi==0.165.0
+uvicorn==0.54.0
+httpx==0.28.1
+
 # Testing
 pytest==9.2.0
 

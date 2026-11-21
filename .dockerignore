@@ -1,0 +1,16 @@
+.git
+.github
+.venv
+venv
+.env
+.dvc
+data
+mlruns
+mlflow*.db
+models
+notebooks
+tests
+__pycache__
+*.pyc
+*.pdf
+.DS_Store

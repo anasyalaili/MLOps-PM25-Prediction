@@ -1,0 +1,84 @@
+# Orkestrasi sistem prediksi PM2.5: server MLflow + seed model + API inferensi.
+#   docker compose up -d --build
+#   docker compose ps
+#   curl localhost:8000/health
+name: pm25
+
+services:
+  mlflow-server:
+    build:
+      context: .
+      dockerfile: Dockerfile.mlflow
+    container_name: pm25-mlflow
+    ports:
+      - "5000:5000"
+    volumes:
+      - mlflow-data:/mlflow
+    networks:
+      - pm25-net
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request as u; u.urlopen('http://localhost:5000/health')"
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+    restart: unless-stopped
+
+  # Sekali jalan: daftarkan model demo ke registry lalu berhenti (exit 0).
+  mlflow-init:
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+    image: pm25-api:latest
+    container_name: pm25-init
+    command: ["python", "seed_registry.py"]
+    environment:
+      MLFLOW_TRACKING_URI: http://mlflow-server:5000
+    networks:
+      - pm25-net
+    depends_on:
+      mlflow-server:
+        condition: service_healthy
+    restart: "no"
+
+  api-service:
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+    image: pm25-api:latest
+    container_name: pm25-api
+    ports:
+      - "8000:8000"
+    environment:
+      MLFLOW_TRACKING_URI: http://mlflow-server:5000
+      MODEL_NAME: pm25-karhutla-h6
+      MODEL_STAGE: Production
+    networks:
+      - pm25-net
+    depends_on:
+      mlflow-server:
+        condition: service_healthy
+      mlflow-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request as u; u.urlopen('http://localhost:8000/health')"
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 15s
+    restart: unless-stopped
+
+networks:
+  pm25-net:
+    driver: bridge
+
+volumes:
+  mlflow-data:
