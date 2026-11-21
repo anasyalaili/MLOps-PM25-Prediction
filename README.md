@@ -21,7 +21,8 @@ Berbeda dari pendekatan prediksi AQI konvensional yang hanya mengandalkan data c
 | Model Registry (registrasi, stage, silsilah, inferensi) | Berjalan; manual lewat `src/register_model.py`, dan model yang lolos gate evaluasi masuk Staging otomatis lewat CI |
 | CI/CD (lint, tes, training, evaluasi, registry Staging) | Tersedia lewat GitHub Actions (`mlops-automation.yaml`) |
 | Retraining terjadwal atau berbasis drift | Belum diimplementasi (training otomatis baru dipicu oleh push ke `main`) |
-| Serving model (API), monitoring, dan containerization | Belum diimplementasi |
+| Serving model (API) dan orkestrasi Docker Compose | Berjalan lokal; `docker compose up -d` menjalankan MLflow, seed model demo, dan API inferensi (lihat *Menjalankan Seluruh Sistem dengan Docker Compose*) |
+| Monitoring | Belum diimplementasi |
 
 Hasil terbaik saat ini: ExtraTrees dengan target selisih (`delta`) dan 28 fitur
 tanpa hotspot, CV RMSE 315,3 µg/m³ dibanding 354,3 pada baseline "jam yang sama
@@ -30,7 +31,7 @@ akurasi pada horizon 6 jam di data ini (lihat *Hasil Eksperimen Skema v4*).
 
 ## Mulai Cepat
 
-Mereproduksi model terbaik dari nol (butuh akses ke remote data Nextcloud):
+Mereproduksi model terbaik dari nol (butuh akses ke remote data Nextcloud; tanpa akses, lihat *Tanpa akses ke Nextcloud* di bawah):
 
 ```bash
 git clone https://github.com/anasyalaili/MLOps-PM25-Prediction.git
@@ -55,6 +56,42 @@ mlflow ui --backend-store-uri sqlite:///mlflow.db --port 5000
 `dvc pull` mengambil data sesuai pointer di commit yang sedang di-checkout, jadi
 pastikan commit itu memuat dataset skema v4 (tag `data-v4` atau yang lebih baru).
 
+### Tanpa akses ke Nextcloud
+
+Data proyek disimpan di Nextcloud milik pengembang, sehingga `dvc pull` hanya
+berhasil bagi yang memiliki kredensialnya. Tanpa akses tersebut, kode tetap
+dapat dijalankan:
+
+```bash
+# 1. Menjalankan tes dan pemeriksaan gaya kode (tidak membutuhkan akses apa pun)
+pip install -r requirements.txt
+pytest
+black --check src tests && flake8 src tests
+
+# 2. Membangun dataset sendiri (membutuhkan FIRMS_MAP_KEY milik sendiri)
+echo "FIRMS_MAP_KEY=<kunci_firms_anda>" > .env
+python src/ingest_data.py --mode backfill --backfill-days 90
+python src/ingest_data.py --mode historical \
+    --start-date 2025-06-01 --end-date 2025-11-30     # opsional: riwayat musim kemarau
+python src/preprocess.py
+python src/build_features.py
+
+# 3. Melatih model pada dataset tersebut
+python src/train.py --model extra --n-estimators 300 --max-depth 12 \
+    --min-samples-leaf 10 --max-features 0.5 --target-mode delta --no-hotspot \
+    --cv-folds 4 --data-version lokal --experiment pm25-karhutla-h6-lokal \
+    --run-name champion-lokal
+```
+
+Metrik hasil pelatihan ini akan berbeda dari angka di README karena dataset
+yang dibangun berbeda rentang dan waktu pengambilannya. Perintah `dvc add` dan
+`dvc push` tidak diperlukan pada alur ini.
+
+Workflow GitHub Actions pada salinan (*fork*) repositori tidak berjalan
+otomatis: Actions perlu diaktifkan di fork tersebut, secret (`NEXTCLOUD_USER`,
+`NEXTCLOUD_APP_PASSWORD`, `FIRMS_MAP_KEY`) harus didaftarkan, dan remote DVC
+harus diarahkan ke penyimpanan milik sendiri.
+
 Untuk menambah data, membangun ulang dataset, atau mendaftarkan model, ikuti
 bagian *Alur Lengkap* dan *Model Registry*. Dengan Codespaces, lingkungan Python
 sudah siap (lihat *Cara Menjalankan via GitHub Codespaces*).
@@ -62,7 +99,7 @@ sudah siap (lihat *Cara Menjalankan via GitHub Codespaces*).
 ## Daftar Isi
 
 - [Tujuan Proyek](#tujuan-proyek) dan [Status Proyek](#status-proyek)
-- [Mulai Cepat](#mulai-cepat)
+- [Mulai Cepat](#mulai-cepat) dan [Docker Compose](#menjalankan-seluruh-sistem-dengan-docker-compose)
 - [Struktur Direktori](#struktur-direktori)
 - [Instalasi](#instalasi-dependencies) dan [Codespaces](#cara-menjalankan-via-github-codespaces)
 - Pipeline data: [Ingestion](#menjalankan-ingestion), [Prapemrosesan](#prapemrosesan), [Feature Engineering](#feature-engineering)
@@ -74,6 +111,104 @@ sudah siap (lihat *Cara Menjalankan via GitHub Codespaces*).
 - [Alur Lengkap](#alur-lengkap)
 - [CI/CD: MLOps Automation](#cicd-mlops-automation-github-actions)
 - [Standar Kode](#standar-kode-pep-8), [Pengujian](#pengujian-pytest), [Pemecahan Masalah](#pemecahan-masalah), [Branching](#branching-strategy), [Tech Stack](#tech-stack), [Sumber Data](#sumber-data)
+
+## Menjalankan Seluruh Sistem dengan Docker Compose
+
+Satu perintah menjalankan seluruh sistem serving: server MLflow, seed model
+demo, dan API inferensi. Prasyarat hanya Docker (Docker Desktop atau Docker
+Engine dengan Compose v2); tidak perlu Python, `.env`, ataupun akses DVC.
+
+```bash
+docker compose up -d --build     # bangun image dan jalankan semua layanan
+docker compose ps                # cek status; tunggu api-service "healthy"
+```
+
+Build pertama memakan beberapa menit (mengunduh dependensi), run berikutnya
+beberapa detik. Setelah `api-service` berstatus `healthy`:
+
+| Alamat | Isi |
+|---|---|
+| http://localhost:5000 | UI MLflow (eksperimen dan Model Registry) |
+| http://localhost:8000/docs | Dokumentasi interaktif API (Swagger) |
+| http://localhost:8000/health | Status API dan apakah model sudah termuat |
+
+### Layanan
+
+| Layanan | Peran | Port |
+|---|---|---|
+| `mlflow-server` | Server tracking dan registry MLflow (SQLite dan artefak di volume `mlflow-data`) | 5000 |
+| `mlflow-init` | Berjalan sekali: melatih model demo lalu mendaftarkan dan mempromosikannya ke Production, kemudian berhenti (`Exited (0)` itu normal) | - |
+| `api-service` | API FastAPI yang memuat model Production dari MLflow | 8000 |
+
+Ketiganya berada di custom bridge network `pm25-net`, sehingga `api-service`
+memanggil MLflow lewat nama layanan (`http://mlflow-server:5000`).
+`depends_on` dengan healthcheck mengatur urutan start: `mlflow-server` sehat,
+lalu `mlflow-init` selesai, baru `api-service` dimulai. Artefak model dikirim
+lewat HTTP ke `mlflow-server`, jadi hanya layanan itu yang memasang volume.
+
+Bentuk keluaran `docker compose ps` saat sistem siap:
+
+```
+NAME          SERVICE         STATUS                      PORTS
+pm25-api      api-service     Up (healthy)                0.0.0.0:8000->8000/tcp
+pm25-init     mlflow-init     Exited (0)
+pm25-mlflow   mlflow-server   Up (healthy)                0.0.0.0:5000->5000/tcp
+```
+
+### Mencoba API
+
+```bash
+curl http://localhost:8000/model-info      # versi, stage, dan 34 fitur model aktif
+```
+
+`POST /predict` menerima daftar baris dengan seluruh fitur dari
+`/model-info`, dan mengembalikan prediksi PM2.5 H+6 (µg/m³):
+
+```bash
+python3 - <<'PY'
+import json, urllib.request
+base = "http://localhost:8000"
+features = json.load(urllib.request.urlopen(f"{base}/model-info"))["features"]
+row = {name: 0.5 for name in features}
+row["pm2_5"] = 120.0
+req = urllib.request.Request(
+    f"{base}/predict",
+    json.dumps({"records": [row]}).encode(),
+    {"Content-Type": "application/json"},
+)
+print(urllib.request.urlopen(req).read().decode())
+PY
+```
+
+Endpoint lain: `POST /reload` memuat ulang model dari registry (mis. setelah
+Anda mempromosikan versi baru di UI MLflow), dan `GET /health` mengembalikan
+`model_loaded: false` bila registry belum berisi model Production.
+
+### Data tetap setelah dimatikan
+
+```bash
+docker compose down              # hentikan dan hapus kontainer (volume tetap)
+docker compose up -d             # model v1 masih ada; seed melaporkan "dilewati"
+docker compose down -v           # hapus juga volume (mulai dari kosong)
+```
+
+### Catatan
+
+- **Model di Docker adalah model demo.** Karena data proyek ada di remote DVC
+  yang butuh kredensial, `mlflow-init` melatih ExtraTrees kecil pada **data
+  sintetis** dengan 34 fitur yang sama seperti champion. Prediksinya tidak
+  bermakna dan tidak boleh dibandingkan dengan hasil di README ini. Untuk
+  melayani model sungguhan, latih dan daftarkan ke server MLflow ini
+  (`MLFLOW_TRACKING_URI=http://localhost:5000 python src/train.py ...
+  --register-model`), promosikan ke Production lewat UI atau
+  `register_model.py promote`, lalu panggil `POST /reload`.
+- **Hanya untuk pengembangan lokal.** Server MLflow dijalankan dengan
+  `--allowed-hosts "*"` agar nama layanan Docker diterima, dan tanpa
+  autentikasi. Jangan membuka port 5000 dan 8000 ke jaringan umum.
+- **Port bentrok.** Bila port 5000 atau 8000 sudah terpakai (di macOS, port
+  5000 sering dipakai AirPlay Receiver), ubah sisi kiri pemetaan `ports` di
+  `docker-compose.yaml`, mis. `"5001:5000"`.
+- Melihat log: `docker compose logs -f api-service` (atau `mlflow-init`).
 
 ## Struktur Direktori
 ```
@@ -100,16 +235,23 @@ MLOps-PM25-Prediction/
 │   ├── train.py
 │   ├── register_model.py
 │   ├── evaluate_model.py
-│   └── mlflow_store.py
+│   ├── mlflow_store.py
+│   ├── serve.py                  # API inferensi FastAPI
+│   └── seed_registry.py          # seed model demo untuk Docker
 ├── config/
 │   └── model_thresholds.toml         # ambang gate evaluasi model (CI)
 ├── tests/                            # tes pytest
 ├── .dvcignore
 ├── .flake8
+├── .dockerignore
 ├── .gitignore
+├── Dockerfile.api                    # image API inferensi dan seed
+├── Dockerfile.mlflow                 # image server MLflow
+├── docker-compose.yaml               # orkestrasi layanan
 ├── LICENSE
 ├── pyproject.toml
 ├── requirements.txt
+├── requirements-api.txt              # dependensi minimal image API
 └── README.md
 ```
 
@@ -1096,6 +1238,7 @@ pytest -k hotspot            # tes yang namanya memuat "hotspot"
 | `test_register_model.py` | Siklus registry penuh: register, promote, archive, metadata, verify, active |
 | `test_evaluate_model.py` | Logika gate (baseline musiman, champion-challenger, toleransi), laporan, dan alur evaluasi pada store sementara |
 | `test_mlflow_store.py` | Sinkronisasi store ke WebDAV (server palsu, ETag, konflik) dan pruning artefak model |
+| `test_serve.py` | Seed registry (idempoten) dan API inferensi: `/health`, `/model-info`, `/predict` (termasuk validasi fitur), `/reload` |
 
 Konfigurasi pytest ada di `pyproject.toml`. Workflow
 `.github/workflows/mlops-automation.yaml` menjalankan tes yang sama pada setiap
@@ -1140,8 +1283,8 @@ Proyek ini mengikuti **GitHub Flow**:
 | Data Versioning | DVC |
 | CI/CD & Automation | GitHub Actions |
 | Experiment Tracking & Registry | MLflow |
-| Containerization | Docker, Docker Compose (rencana, belum diimplementasi) |
-| Model Serving | MLflow Models (rencana, belum diimplementasi) |
+| Containerization | Docker, Docker Compose (`docker-compose.yaml`) |
+| Model Serving | FastAPI dan Uvicorn, memuat model dari MLflow Model Registry |
 | Monitoring | Prometheus, Grafana (rencana, belum diimplementasi) |
 
 ## Sumber Data
