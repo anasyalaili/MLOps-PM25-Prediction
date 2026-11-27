@@ -1,6 +1,12 @@
 {
   "name": "MLOps-PM25-Prediction",
-  "image": "mcr.microsoft.com/devcontainers/python:3.14",
+  "image": "mcr.microsoft.com/devcontainers/python:3.14-bookworm",
+
+  "features": {
+    "ghcr.io/devcontainers/features/docker-in-docker:2": {
+      "moby": false
+    }
+  },
 
   "customizations": {
     "vscode": {
@@ -18,9 +24,10 @@
 
   "postCreateCommand": "pip install --upgrade pip && pip install -r requirements.txt",
 
-  "forwardPorts": [8000, 5000, 9090, 3000],
+  "forwardPorts": [8000, 8001, 5000, 9090, 3000],
   "portsAttributes": {
-    "8000": { "label": "Model Serving" },
+    "8000": { "label": "Model Serving (load balancer)" },
+    "8001": { "label": "mlflow models serve" },
     "5000": { "label": "MLflow Tracking UI" },
     "9090": { "label": "Prometheus" },
     "3000": { "label": "Grafana" }
