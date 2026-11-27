@@ -1,7 +1,10 @@
-# Orkestrasi sistem prediksi PM2.5: server MLflow + seed model + API inferensi.
-#   docker compose up -d --build
+# Orkestrasi sistem prediksi PM2.5: server MLflow, 3 replika API model, Nginx.
+#   docker compose up -d --wait mlflow-server     # registry
+#   (latih, kemas, lalu mlflow models build-docker -> image pm25-model)
+#   docker compose up -d --wait                   # seluruh sistem
 #   docker compose ps
-#   curl localhost:8000/health
+# API FastAPI dan seed model sintetis dari versi sebelumnya ada di profil demo:
+#   docker compose --profile demo up -d api-service
 name: pm25
 
 services:
@@ -30,6 +33,7 @@ services:
 
   # Sekali jalan: daftarkan model demo ke registry lalu berhenti (exit 0).
   mlflow-init:
+    profiles: ["demo"]
     build:
       context: .
       dockerfile: Dockerfile.api
@@ -45,14 +49,56 @@ services:
         condition: service_healthy
     restart: "no"
 
+  # Image dibuat dengan `mlflow models build-docker` (lihat README).
+  # Tanpa container_name dan ports tetap, agar bisa direplikasi.
+  model-api:
+    image: pm25-model:latest
+    pull_policy: never
+    platform: linux/amd64
+    environment:
+      MLFLOW_MODELS_WORKERS: "1"
+    deploy:
+      replicas: 3
+    networks:
+      - pm25-net
+    depends_on:
+      mlflow-server:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request as u; u.urlopen('http://localhost:8080/ping')"
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+    restart: unless-stopped
+
+  load-balancer:
+    image: nginx:1.29-alpine
+    container_name: pm25-lb
+    ports:
+      - "8000:80"
+    volumes:
+      - ./config/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+    networks:
+      - pm25-net
+    depends_on:
+      model-api:
+        condition: service_healthy
+    restart: unless-stopped
+
   api-service:
+    profiles: ["demo"]
     build:
       context: .
       dockerfile: Dockerfile.api
     image: pm25-api:latest
     container_name: pm25-api
     ports:
-      - "8000:8000"
+      - "8001:8000"
     environment:
       MLFLOW_TRACKING_URI: http://mlflow-server:5000
       MODEL_NAME: pm25-karhutla-h6
