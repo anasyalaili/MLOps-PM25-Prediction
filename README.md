@@ -22,7 +22,7 @@ Berbeda dari pendekatan prediksi AQI konvensional yang hanya mengandalkan data c
 | CI/CD (lint, tes, training, evaluasi, registry Staging) | Tersedia lewat GitHub Actions (`mlops-automation.yaml`) |
 | Retraining terjadwal atau berbasis drift | Belum diimplementasi (training otomatis baru dipicu oleh push ke `main`) |
 | Serving model (MLflow Models) dan orkestrasi Docker Compose | Berjalan lokal/Codespaces; 3 replika API di belakang load balancer (lihat *Menjalankan Seluruh Sistem dengan Docker Compose*) |
-| Monitoring | Belum diimplementasi |
+| Monitoring (Prometheus, Grafana, alert) | Berjalan lokal/Codespaces (lihat *Monitoring dengan Prometheus dan Grafana*) |
 
 Hasil terbaik saat ini: ExtraTrees dengan target selisih (`delta`) dan 28 fitur
 tanpa hotspot, CV RMSE 315,3 µg/m³ dibanding 354,3 pada baseline "jam yang sama
@@ -99,7 +99,7 @@ sudah siap (lihat *Cara Menjalankan via GitHub Codespaces*).
 ## Daftar Isi
 
 - [Tujuan Proyek](#tujuan-proyek) dan [Status Proyek](#status-proyek)
-- [Mulai Cepat](#mulai-cepat) dan [Docker Compose](#menjalankan-seluruh-sistem-dengan-docker-compose)
+- [Mulai Cepat](#mulai-cepat) dan [Docker Compose](#menjalankan-seluruh-sistem-dengan-docker-compose), [Monitoring](#monitoring-dengan-prometheus-dan-grafana)
 - [Struktur Direktori](#struktur-direktori)
 - [Instalasi](#instalasi-dependencies) dan [Codespaces](#cara-menjalankan-via-github-codespaces)
 - Pipeline data: [Ingestion](#menjalankan-ingestion), [Prapemrosesan](#prapemrosesan), [Feature Engineering](#feature-engineering)
@@ -114,8 +114,9 @@ sudah siap (lihat *Cara Menjalankan via GitHub Codespaces*).
 
 ## Menjalankan Seluruh Sistem dengan Docker Compose
 
-Sistem serving terdiri dari server MLflow (registry), tiga replika API model
-hasil `mlflow models build-docker`, dan Nginx sebagai load balancer.
+Sistem terdiri dari server MLflow (registry), tiga replika API model hasil
+`mlflow models build-docker`, Nginx sebagai load balancer, serta Prometheus dan
+Grafana untuk pemantauan.
 Prasyarat: Docker dengan Compose v2 dan `pip install -r requirements.txt`.
 Codespaces proyek ini sudah menyertakan Docker (setelah *Rebuild Container*).
 
@@ -131,10 +132,12 @@ docker compose up -d --wait
 | `mlflow-server` | Tracking dan Model Registry (volume `mlflow-data`) | 5000 |
 | `model-api` (3 replika) | API model MLflow (`/ping`, `/invocations`) | internal 8080 |
 | `load-balancer` | Nginx, membagi request ke replika secara bergiliran | 8000 |
+| `prometheus` | Mengambil `/metrics` dari tiap replika setiap 5 detik | 9090 |
+| `grafana` | Dashboard dan alert | 3000 |
 
 Semua berada di custom bridge network `pm25-net`. `depends_on` dengan
 healthcheck mengatur urutan start: `mlflow-server`, lalu `model-api`, lalu
-`load-balancer`. Model tertanam di image, sehingga replika tidak mengunduh apa
+`load-balancer` dan `prometheus`, terakhir `grafana`. Model tertanam di image, sehingga replika tidak mengunduh apa
 pun saat start. Jumlah replika diatur lewat `deploy: replicas`.
 
 ### 1. Model Production di registry
@@ -276,6 +279,85 @@ docker compose down -v            # hapus juga registry
 - **Hanya untuk pengembangan lokal:** tanpa autentikasi, dan MLflow memakai
   `--allowed-hosts "*"`.
 
+## Monitoring dengan Prometheus dan Grafana
+
+Monitoring ikut berjalan bersama `docker compose up -d --wait`. Image model
+harus dibangun dari versi hasil `package_model.py` yang sekarang (menyertakan
+`prometheus-client` dan baseline drift):
+
+```bash
+export MLFLOW_TRACKING_URI=http://localhost:5000
+docker compose up -d --build --wait mlflow-server
+python src/package_model.py          # butuh data/processed untuk baseline PSI
+mlflow models build-docker -m "models:/pm25-karhutla-h6/Production" \
+    -n pm25-model --env-manager local
+docker compose up -d --wait
+```
+
+| Alamat | Isi |
+|---|---|
+| http://localhost:3000/d/pm25-serving | Dashboard Grafana (bisa dilihat tanpa login; admin: `admin` / `GRAFANA_PASSWORD`, default `admin`) |
+| http://localhost:3000/alerting/list | Status alert |
+| http://localhost:9090/targets | Status scraping tiap replika |
+| http://localhost:8000/metrics | Metrik salah satu replika |
+
+Di Codespaces, buka port tersebut lewat tab **Ports**.
+
+### Alur metrik
+
+`src/metrics_app.py` membungkus server MLflow di setiap replika: `/ping` dan
+`/invocations` tidak berubah, ditambah `/metrics`. Prometheus menemukan semua
+replika lewat DNS Docker (`monitoring/prometheus.yml`), termasuk yang ditambah
+dengan `--scale`. Sumber data, dashboard, dan alert Grafana dimuat otomatis dari
+`monitoring/grafana/`.
+
+| Metrik | Isi |
+|---|---|
+| `pm25_requests_total` | Jumlah request `/invocations` per status HTTP |
+| `pm25_request_duration_seconds` | Histogram latensi inferensi |
+| `pm25_input_ugm3`, `pm25_prediction_ugm3` | Sebaran input PM2.5 dan prediksi H+6 |
+| `pm25_drift_psi`, `pm25_drift_window_samples` | PSI input PM2.5 dan jumlah sampelnya |
+| `pm25_process_cpu_seconds_total`, `pm25_container_memory_bytes` | CPU proses dan RAM kontainer |
+| `pm25_model_offline_metric`, `pm25_model_info` | Metrik uji saat training dan identitas model |
+
+### Dashboard dan alert
+
+Dashboard **PM2.5 Model Serving** berisi ringkasan, operasional (latensi p50,
+p95, p99; throughput total dan per replika; status HTTP; CPU; RAM), prediksi dan
+data drift, serta performa model.
+
+| Alert | Kondisi (bertahan 30 detik) |
+|---|---|
+| Latensi tinggi | p95 > 1 detik |
+| Data drift PM2.5 | PSI > 0,2 |
+| Replika model kurang | replika sehat < 3 (juga menyala bila sengaja di-scale ke bawah 3) |
+
+Alert hanya tampil di Grafana; notifikasi dan pemicu retraining belum
+dikonfigurasi.
+
+### Simulasi beban
+
+```bash
+python src/load_test.py --scenario normal --duration 180
+python src/load_test.py --scenario drift --duration 180
+python src/load_test.py --scenario normal --duration 120 --bad-ratio 0.05
+```
+
+`normal` mengirim baris acak dari dataset, `drift` hanya dari 10% jam dengan
+PM2.5 tertinggi, dan `--bad-ratio` menyisipkan request salah (status 400). Laju
+default 5 request per detik (`--rps`). Tanpa dataset, dipakai nilai contoh acak.
+
+### Cara membaca dan batasan
+
+- **PSI** membandingkan 500 input terakhir tiap replika dengan data training, dan
+  baru muncul setelah 100 input. Nilai tinggi menandakan distribusi input
+  berbeda (mis. episode asap atau beda musim), belum tentu model rusak.
+- **Performa model** adalah hasil uji saat training, bukan pengukuran real-time,
+  karena nilai PM2.5 aktual baru tersedia 6 jam kemudian.
+- **Latensi** diukur di dalam replika (termasuk antre), tidak termasuk Nginx.
+  Saat image `amd64` diemulasi (Mac ARM), latensi jauh lebih tinggi.
+- Metrik tersimpan per proses; hitungan kembali nol saat replika dibuat ulang.
+
 ## Struktur Direktori
 ```
 MLOps-PM25-Prediction/
@@ -304,11 +386,16 @@ MLOps-PM25-Prediction/
 │   ├── mlflow_store.py
 │   ├── package_model.py          # bungkus model untuk serving, set Production
 │   ├── pm25_pyfunc.py            # pembungkus pyfunc (keluaran ug/m3)
+│   ├── metrics_app.py            # endpoint /metrics pada server model
+│   ├── load_test.py              # simulasi beban dan drift
 │   ├── serve.py                  # API inferensi FastAPI (profil demo)
 │   └── seed_registry.py          # seed model demo untuk Docker
 ├── config/
 │   ├── model_thresholds.toml         # ambang gate evaluasi model (CI)
 │   └── nginx.conf                    # load balancer replika API
+├── monitoring/
+│   ├── prometheus.yml            # target dan interval scraping
+│   └── grafana/                  # sumber data, dashboard, alert
 ├── examples/
 │   └── predict_request.json          # contoh input /invocations
 ├── tests/                            # tes pytest
@@ -1310,6 +1397,8 @@ pytest -k hotspot            # tes yang namanya memuat "hotspot"
 | `test_evaluate_model.py` | Logika gate (baseline musiman, champion-challenger, toleransi), laporan, dan alur evaluasi pada store sementara |
 | `test_mlflow_store.py` | Sinkronisasi store ke WebDAV (server palsu, ETag, konflik) dan pruning artefak model |
 | `test_package_model.py` | Pengemasan model serving: promosi ke Production, keluaran sama dengan `restore_level`, contoh request valid |
+| `test_metrics_app.py` | `/metrics`, pencatatan request dan prediksi, PSI, metrik CPU/RAM |
+| `test_load_test.py` | Pemilihan data skenario normal dan drift |
 | `test_serve.py` | Seed registry (idempoten) dan API inferensi: `/health`, `/model-info`, `/predict` (termasuk validasi fitur), `/reload` |
 
 Konfigurasi pytest ada di `pyproject.toml`. Workflow
@@ -1357,7 +1446,7 @@ Proyek ini mengikuti **GitHub Flow**:
 | Experiment Tracking & Registry | MLflow |
 | Containerization | Docker, Docker Compose (`docker-compose.yaml`) |
 | Model Serving | MLflow Models (`serve`, `build-docker`), Nginx; FastAPI untuk profil demo |
-| Monitoring | Prometheus, Grafana (rencana, belum diimplementasi) |
+| Monitoring | Prometheus, Grafana |
 
 ## Sumber Data
 

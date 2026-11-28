@@ -13,17 +13,33 @@ Contoh:
 import argparse
 import json
 import os
+import tempfile
 import warnings
 
 import mlflow
 import mlflow.pyfunc
+import numpy as np
 import pandas as pd
 from mlflow import MlflowClient
 from mlflow.models import infer_signature
 
+from train import CURRENT_COLUMN, DEFAULT_DATA_PATH, load_dataset
+
 DEFAULT_MODEL_NAME = "pm25-karhutla-h6"
 DEFAULT_EXPERIMENT = "pm25-karhutla-h6-serving"
 WRAPPER_TAG = "serving_wrapper"
+PSI_BINS = 10
+# Metrik training yang ditampilkan di dashboard (bila tercatat di run).
+OFFLINE_METRICS = (
+    "cv_rmse_mean",
+    "cv_seasonal_rmse_mean",
+    "cv_mae_mean",
+    "cv_seasonal_mae_mean",
+    "cv_gt150_recall_mean",
+    "test_rmse",
+    "test_mae",
+    "test_gt150_recall",
+)
 CODE_PATH = os.path.join(os.path.dirname(__file__), "pm25_pyfunc.py")
 
 EXAMPLE_VALUES = {
@@ -62,6 +78,11 @@ def parse_arguments(argv=None):
     )
     parser.add_argument("--experiment", default=DEFAULT_EXPERIMENT)
     parser.add_argument(
+        "--data",
+        default=DEFAULT_DATA_PATH,
+        help="Dataset untuk baseline drift (PSI) di pemantauan.",
+    )
+    parser.add_argument(
         "--example", help="Tulis contoh request /invocations ke berkas ini."
     )
     return parser.parse_args(argv)
@@ -91,6 +112,48 @@ def find_base_version(client, name, number=None):
     raise ValueError(f"Tidak ada model dasar bernama '{name}'.")
 
 
+def drift_baseline(values, bins=PSI_BINS):
+    """Batas bin (kuantil) dan proporsi data training per bin."""
+    values = np.asarray(values, dtype=float)
+    values = values[~np.isnan(values)]
+    quantiles = np.linspace(0, 1, bins + 1)[1:-1]
+    edges = np.unique(np.quantile(values, quantiles))
+    positions = np.searchsorted(edges, values, side="right")
+    counts = np.bincount(positions, minlength=len(edges) + 1)
+    return {
+        "edges": edges.tolist(),
+        "expected": (counts / len(values)).tolist(),
+    }
+
+
+def monitoring_info(run, base_version, data_path):
+    """Isi monitoring.json: metrik training dan baseline drift."""
+    info = {
+        "base_version": int(base_version),
+        "data_version": run.data.tags.get("data_version", ""),
+        "offline_metrics": {
+            name: run.data.metrics[name]
+            for name in OFFLINE_METRICS
+            if name in run.data.metrics
+        },
+        "baseline": {},
+    }
+    try:
+        data = load_dataset(data_path)
+    except FileNotFoundError:
+        print(
+            f"PERINGATAN: dataset '{data_path}' tidak ada; PSI drift tidak "
+            "akan tersedia di dashboard."
+        )
+        return info
+    # Baris awal sebanyak n_train adalah bagian yang dipakai melatih model.
+    rows = int(run.data.params.get("n_train", len(data)))
+    info["baseline"][CURRENT_COLUMN] = drift_baseline(
+        data[CURRENT_COLUMN].iloc[:rows]
+    )
+    return info
+
+
 def package(args):
     """Bungkus, daftarkan, dan promosikan model."""
     mlflow.set_tracking_uri(args.tracking_uri)
@@ -102,10 +165,23 @@ def package(args):
     data_version = run.data.tags.get("data_version", "")
 
     example = pd.DataFrame([example_row(features)])
-    requirements = ["mlflow", "scikit-learn", "numpy", "pandas", "skops"]
+    requirements = [
+        "mlflow",
+        "scikit-learn",
+        "numpy",
+        "pandas",
+        "skops",
+        "prometheus-client",
+    ]
     if run.data.params.get("model") == "xgb":
         requirements.append("xgboost")
     pinned = [f"{pkg}=={installed_version(pkg)}" for pkg in requirements]
+
+    monitoring = monitoring_info(run, base.version, args.data)
+    folder = tempfile.mkdtemp()
+    monitoring_path = os.path.join(folder, "monitoring.json")
+    with open(monitoring_path, "w", encoding="utf-8") as handle:
+        json.dump(monitoring, handle)
 
     mlflow.set_experiment(args.experiment)
     with mlflow.start_run(run_name=f"serving-v{base.version}") as wrapper:
@@ -125,9 +201,12 @@ def package(args):
         mlflow.pyfunc.log_model(
             name="model",
             python_model=CODE_PATH,
-            artifacts={"base": f"models:/{args.model_name}/{base.version}"},
+            artifacts={
+                "base": f"models:/{args.model_name}/{base.version}",
+                "monitoring": monitoring_path,
+            },
             model_config={"features": features, "target_mode": target_mode},
-            signature=infer_signature(example, pd.Series([0.0]).to_numpy()),
+            signature=infer_signature(example, np.array([0.0])),
             input_example=example,
             pip_requirements=pinned,
             registered_model_name=args.model_name,

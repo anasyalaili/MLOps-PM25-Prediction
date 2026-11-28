@@ -10,6 +10,7 @@ from mlflow import MlflowClient
 
 import package_model
 import seed_registry
+import train
 from train import FEATURES, restore_level
 
 NAME = "pm25-karhutla-h6"
@@ -69,3 +70,40 @@ def test_packaging_again_uses_base_version(packaged):
 def test_example_row_picks_most_specific_prefix():
     row = package_model.example_row(["pm2_5_diff_1h", "pm2_5_lag_1h"])
     assert row == {"pm2_5_diff_1h": 5.0, "pm2_5_lag_1h": 120.0}
+
+
+def test_monitoring_baseline_from_training_rows(packaged, processed_dir):
+    client = MlflowClient()
+    run_id = client.get_model_version(NAME, "1").run_id
+    run = client.get_run(run_id)
+    info = package_model.monitoring_info(run, 1, processed_dir)
+    baseline = info["baseline"]["pm2_5"]
+    assert len(baseline["expected"]) == len(baseline["edges"]) + 1
+    assert sum(baseline["expected"]) == pytest.approx(1.0)
+    without = package_model.monitoring_info(run, 1, "tidak-ada")
+    assert without["baseline"] == {}
+
+
+def test_offline_metrics_match_training_run(
+    processed_dir, tmp_path, monkeypatch
+):
+    uri = f"sqlite:///{tmp_path}/mlflow.db"
+    monkeypatch.chdir(tmp_path)
+    code = train.main(
+        [
+            "--data", processed_dir,
+            "--tracking-uri", uri,
+            "--run-name", "kecil",
+            "--data-version", "test-data",
+            "--n-estimators", "5",
+            "--cv-folds", "2",
+            "--register-model",
+        ]
+    )  # fmt: skip
+    assert code == 0
+    client = MlflowClient(uri)
+    run_id = client.get_model_version(NAME, "1").run_id
+    info = package_model.monitoring_info(
+        client.get_run(run_id), 1, processed_dir
+    )
+    assert set(info["offline_metrics"]) == set(package_model.OFFLINE_METRICS)
